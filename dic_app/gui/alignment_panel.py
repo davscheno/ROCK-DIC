@@ -18,6 +18,9 @@ from dic_app.gui.image_viewer import ImageViewer
 from dic_app.core.image_registration import (
     ImageRegistration, AlignmentParameters, AlignmentResult, AlignmentMethod
 )
+from dic_app.utils.helpers import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class AlignmentPanelWidget(QWidget):

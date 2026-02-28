@@ -96,6 +96,13 @@ class ImageLoader:
         if image_gray is None:
             raise IOError(f"Failed to load image: {filepath}")
 
+        # Warn if image has very low contrast (may cause poor DIC results)
+        img_std = float(image_gray.std())
+        if img_std < 10:
+            logger.warning(
+                f"Image '{os.path.basename(filepath)}' has very low contrast "
+                f"(std={img_std:.1f}). DIC results may be unreliable.")
+
         h, w = image_gray.shape
 
         # Extract EXIF metadata
@@ -225,7 +232,18 @@ class ImageLoader:
         """
         if focal_length_mm <= 0 or image_width_px <= 0:
             raise ValueError("Focal length and image width must be positive")
-        return (altitude_m * sensor_width_mm) / (focal_length_mm * image_width_px)
+        if altitude_m <= 0:
+            raise ValueError("Altitude must be positive")
+        if sensor_width_mm <= 0:
+            raise ValueError("Sensor width must be positive")
+        gsd = (altitude_m * sensor_width_mm) / (focal_length_mm * image_width_px)
+        if gsd < 0.001 or gsd > 100:
+            logger.warning(
+                f"Computed GSD={gsd:.6f} m/px is outside expected range "
+                f"[0.001, 100]. Check input parameters: "
+                f"alt={altitude_m}m, fl={focal_length_mm}mm, "
+                f"sensor={sensor_width_mm}mm, width={image_width_px}px")
+        return gsd
 
     @staticmethod
     def load_geotiff(filepath: str):

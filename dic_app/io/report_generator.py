@@ -643,7 +643,11 @@ class ReportGenerator:
         ax = axes[0, 0]
         valid_mag = mag[~np.isnan(mag)]
         if len(valid_mag) > 0:
-            ax.hist(valid_mag, bins=50, color='steelblue', edgecolor='white', alpha=0.8)
+            # Handle edge case: all values identical (histogram needs range)
+            if np.ptp(valid_mag) < 1e-12:
+                ax.hist(valid_mag, bins=1, color='steelblue', edgecolor='white', alpha=0.8)
+            else:
+                ax.hist(valid_mag, bins=50, color='steelblue', edgecolor='white', alpha=0.8)
         ax.set_xlabel("Spostamento (pixel)")
         ax.set_ylabel("Frequenza")
         ax.set_title("Distribuzione Spostamenti")
@@ -669,7 +673,10 @@ class ReportGenerator:
         ax = axes[1, 0]
         valid_q = self.result.correlation_quality[~np.isnan(self.result.correlation_quality)]
         if len(valid_q) > 0:
-            ax.hist(valid_q, bins=50, color='seagreen', edgecolor='white', alpha=0.8)
+            if np.ptp(valid_q) < 1e-12:
+                ax.hist(valid_q, bins=1, color='seagreen', edgecolor='white', alpha=0.8)
+            else:
+                ax.hist(valid_q, bins=50, color='seagreen', edgecolor='white', alpha=0.8)
         ax.set_xlabel("Coefficiente Correlazione")
         ax.set_ylabel("Frequenza")
         ax.set_title("Distribuzione Qualita Correlazione")
@@ -762,25 +769,31 @@ class ReportGenerator:
             (self.result.v, "displacement_v"),
             (self.result.correlation_quality, "correlation_quality"),
         ]:
-            fig, ax = plt.subplots(figsize=(12, 8))
-            if self.base_image is not None:
-                if self.base_image.ndim == 2:
-                    ax.imshow(self.base_image, cmap='gray', alpha=0.5)
-                else:
-                    ax.imshow(self.base_image, alpha=0.5)
+            fig = None
+            try:
+                fig, ax = plt.subplots(figsize=(12, 8))
+                if self.base_image is not None:
+                    if self.base_image.ndim == 2:
+                        ax.imshow(self.base_image, cmap='gray', alpha=0.5)
+                    else:
+                        ax.imshow(self.base_image, alpha=0.5)
 
-            valid = ~np.isnan(field)
-            if np.any(valid):
-                sc = ax.scatter(
-                    self.result.grid_x[valid], self.result.grid_y[valid],
-                    c=field[valid], cmap='jet', s=2)
-                plt.colorbar(sc, ax=ax, shrink=0.6)
+                valid = ~np.isnan(field)
+                if np.any(valid):
+                    sc = ax.scatter(
+                        self.result.grid_x[valid], self.result.grid_y[valid],
+                        c=field[valid], cmap='jet', s=2)
+                    plt.colorbar(sc, ax=ax, shrink=0.6)
 
-            ax.set_title(name.replace('_', ' ').title())
-            ax.invert_yaxis()
-            plt.tight_layout()
-            fig.savefig(os.path.join(output_dir, f"{name}.png"), dpi=150)
-            plt.close(fig)
+                ax.set_title(name.replace('_', ' ').title())
+                ax.invert_yaxis()
+                plt.tight_layout()
+                fig.savefig(os.path.join(output_dir, f"{name}.png"), dpi=150)
+            except Exception as e:
+                logger.error(f"Error exporting image '{name}': {e}")
+            finally:
+                if fig is not None:
+                    plt.close(fig)
 
         # Vector field
         fig, ax = plt.subplots(figsize=(12, 8))
@@ -845,6 +858,13 @@ class ReportGenerator:
 
         if gps.latitude is None or gps.longitude is None:
             logger.warning("Cannot export GeoTIFF: incomplete GPS data")
+            return
+
+        # Validate GPS coordinates are within plausible range
+        if not (-90 <= gps.latitude <= 90) or not (-180 <= gps.longitude <= 180):
+            logger.warning(
+                f"GPS coordinates out of range: lat={gps.latitude}, "
+                f"lon={gps.longitude}. Skipping GeoTIFF export.")
             return
 
         image_shape = self.result.ref_shape

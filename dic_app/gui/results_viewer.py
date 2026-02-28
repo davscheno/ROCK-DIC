@@ -21,8 +21,10 @@ from dic_app.core.postprocessing import (
     DisplacementSmoother, StrainCalculator, DisplacementStatistics
 )
 from dic_app.utils.helpers import (
-    displacement_colormap, overlay_heatmap, compute_magnitude
+    displacement_colormap, overlay_heatmap, compute_magnitude, setup_logger
 )
+
+logger = setup_logger(__name__)
 
 
 class ResultsViewerWidget(QWidget):

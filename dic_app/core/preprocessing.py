@@ -7,6 +7,9 @@ plus a FilterPipeline class for chaining filters in sequence.
 import numpy as np
 import cv2
 from scipy.ndimage import uniform_filter
+from dic_app.utils.helpers import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class ImageFilters:
@@ -52,7 +55,7 @@ class ImageFilters:
         kernel_size : int, must be odd (default 5)
         sigma : float, Gaussian sigma (0 = auto from kernel_size)
         """
-        k = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        k = max(3, kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
         return cv2.GaussianBlur(image, (k, k), sigma)
 
     @staticmethod
@@ -100,15 +103,15 @@ class ImageFilters:
         amount : float, sharpening strength (1.0 = mild, 2.0 = strong)
         threshold : int, minimum difference to apply sharpening (0-255)
         """
-        k = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        k = max(3, kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
         blurred = cv2.GaussianBlur(image, (k, k), sigma)
-        diff = image.astype(np.float32) - blurred.astype(np.float32)
+        diff = image.astype(np.float64) - blurred.astype(np.float64)
 
         if threshold > 0:
             mask = np.abs(diff) > threshold
             diff = diff * mask
 
-        sharpened = image.astype(np.float32) + amount * diff
+        sharpened = image.astype(np.float64) + amount * diff
         return np.clip(sharpened, 0, 255).astype(np.uint8)
 
     @staticmethod
@@ -167,7 +170,7 @@ class ImageFilters:
         ----------
         kernel_size : int, must be odd
         """
-        k = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+        k = max(3, kernel_size if kernel_size % 2 == 1 else kernel_size + 1)
         return cv2.medianBlur(image, k)
 
     @staticmethod
@@ -222,8 +225,7 @@ class ImageFilters:
         block_size : int, neighborhood size (odd, >= 3)
         c : float, constant subtracted from mean
         """
-        bs = block_size if block_size % 2 == 1 else block_size + 1
-        bs = max(bs, 3)
+        bs = max(3, block_size if block_size % 2 == 1 else block_size + 1)
         thresh = cv2.adaptiveThreshold(
             image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY, bs, c)
@@ -387,6 +389,20 @@ class FilterPipeline:
         entry = FILTER_REGISTRY[filter_name]
         params = dict(entry['params'])
         params.update(kwargs)
+        # Validate parameter types and ranges
+        param_types = entry.get('param_types', {})
+        for pname, pvalue in params.items():
+            if pname in param_types:
+                ptype_info = param_types[pname]
+                ptype = ptype_info[0]
+                if ptype in ('int', 'odd_int'):
+                    pmin, pmax = ptype_info[1], ptype_info[2]
+                    params[pname] = int(np.clip(int(pvalue), pmin, pmax))
+                    if ptype == 'odd_int' and params[pname] % 2 == 0:
+                        params[pname] += 1
+                elif ptype == 'float':
+                    pmin, pmax = ptype_info[1], ptype_info[2]
+                    params[pname] = float(np.clip(float(pvalue), pmin, pmax))
         self.steps.append({
             'filter_name': filter_name,
             'params': params,
@@ -420,11 +436,14 @@ class FilterPipeline:
         np.ndarray (H, W) uint8 processed image
         """
         result = image.copy()
-        for step in self.steps:
-            entry = FILTER_REGISTRY[step['filter_name']]
-            func = entry['func']
-            params = step['params']
-            result = func(result, **params)
+        for i, step in enumerate(self.steps):
+            try:
+                entry = FILTER_REGISTRY[step['filter_name']]
+                func = entry['func']
+                params = step['params']
+                result = func(result, **params)
+            except Exception as e:
+                logger.error("Filter '%s' (step %d) failed: %s. Skipping.", step['filter_name'], i, e)
         return result
 
     def clear(self):

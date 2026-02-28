@@ -1,11 +1,14 @@
 """Report configuration and export dialog."""
 
+import logging
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QLineEdit, QTextEdit, QCheckBox,
     QFileDialog, QFormLayout, QProgressBar, QMessageBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal
+
+logger = logging.getLogger(__name__)
 
 
 class ReportDialog(QDialog):

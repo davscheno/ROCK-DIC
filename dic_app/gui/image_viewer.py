@@ -1,9 +1,12 @@
 """Zoomable, pannable image viewer with overlay support."""
 
+import logging
 import numpy as np
 from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QWheelEvent, QMouseEvent
+
+logger = logging.getLogger(__name__)
 
 
 class ImageViewer(QGraphicsView):

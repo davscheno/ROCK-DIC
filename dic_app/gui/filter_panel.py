@@ -11,6 +11,9 @@ from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from dic_app.gui.image_viewer import ImageViewer
 from dic_app.core.preprocessing import FilterPipeline, FILTER_REGISTRY
 from dic_app.core.auto_filter import AutoFilterOptimizer, compute_quality_metrics
+from dic_app.utils.helpers import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class FilterParamWidget(QFrame):

@@ -44,6 +44,11 @@ def displacement_colormap(magnitude, vmin=None, vmax=None, cmap='jet'):
         vmin = np.nanmin(magnitude)
     if vmax is None:
         vmax = np.nanmax(magnitude)
+    # Handle all-NaN input
+    if np.isnan(vmin):
+        vmin = 0.0
+    if np.isnan(vmax):
+        vmax = 1.0
     if vmax == vmin:
         vmax = vmin + 1.0
 

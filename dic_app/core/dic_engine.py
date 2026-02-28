@@ -8,6 +8,7 @@ Algorithms:
 """
 
 import time
+import threading
 import numpy as np
 import cv2
 from dataclasses import dataclass, field
@@ -149,6 +150,7 @@ class DICEngine:
         self.params = params
         self._progress_callback: Optional[Callable] = None
         self._cancelled = False
+        self._lock = threading.Lock()
 
     def set_progress_callback(self, callback: Callable):
         """Set callback: callback(percent: int, message: str)"""
@@ -156,11 +158,14 @@ class DICEngine:
 
     def cancel(self):
         """Request cancellation of running analysis."""
-        self._cancelled = True
+        with self._lock:
+            self._cancelled = True
 
     def _report_progress(self, percent, message=""):
-        if self._progress_callback:
-            self._progress_callback(int(percent), message)
+        with self._lock:
+            cb = self._progress_callback
+        if cb:
+            cb(int(percent), message)
 
     @staticmethod
     def validate_texture(image: np.ndarray, subset_size: int,
@@ -254,11 +259,20 @@ class DICEngine:
         -------
         DICResult
         """
-        self._cancelled = False
+        with self._lock:
+            self._cancelled = False
         t0 = time.time()
+
+        if ref_image.size == 0 or def_image.size == 0:
+            raise ValueError("Input images must not be empty")
 
         if ref_image.shape != def_image.shape:
             raise ValueError("Reference and deformed images must have the same shape")
+
+        if ref_image.std() < 5:
+            logger.warning("Reference image has very low contrast (std=%.1f). DIC results may be unreliable.", ref_image.std())
+        if def_image.std() < 5:
+            logger.warning("Deformed image has very low contrast (std=%.1f).", def_image.std())
 
         method_map = {
             DICMethod.TEMPLATE_NCC: self._run_template_ncc,
@@ -324,11 +338,14 @@ class DICEngine:
 
         total_points = ny * nx
         processed = 0
+        skipped_low_corr = 0
 
         self._report_progress(0, "Template matching NCC...")
 
         for iy in range(ny):
-            if self._cancelled:
+            with self._lock:
+                cancelled = self._cancelled
+            if cancelled:
                 break
             for ix in range(nx):
                 cy, cx = gy[iy], gx[ix]
@@ -343,12 +360,20 @@ class DICEngine:
                 t_x0, t_x1 = cx - half, cx + half + 1
                 template = ref[t_y0:t_y1, t_x0:t_x1]
 
+                if template.size == 0:
+                    processed += 1
+                    continue
+
                 # Define search window in deformed image
                 s_y0 = max(0, cy - half - sr_y)
                 s_y1 = min(h, cy + half + sr_y + 1)
                 s_x0 = max(0, cx - half - sr_x)
                 s_x1 = min(w, cx + half + sr_x + 1)
                 search_window = deformed[s_y0:s_y1, s_x0:s_x1]
+
+                if search_window.size == 0:
+                    processed += 1
+                    continue
 
                 # Check search window is large enough
                 if (search_window.shape[0] < template.shape[0] or
@@ -363,6 +388,7 @@ class DICEngine:
                 _, max_val, _, max_loc = cv2.minMaxLoc(result_map)
 
                 if max_val < self.params.correlation_threshold:
+                    skipped_low_corr += 1
                     processed += 1
                     continue
 
@@ -392,6 +418,10 @@ class DICEngine:
                 (processed / total_points) * 100,
                 f"NCC: row {iy + 1}/{ny}"
             )
+
+        if total_points > 0 and skipped_low_corr > total_points * 0.5:
+            logger.warning("%.0f%% of points skipped due to low correlation (threshold=%.2f). Consider lowering the threshold.",
+                           skipped_low_corr / total_points * 100, self.params.correlation_threshold)
 
         magnitude = compute_magnitude(u, v)
         mask_valid = ~np.isnan(u)
@@ -425,7 +455,7 @@ class DICEngine:
                 c_center = float(corr_surface[peak_y, peak_x])
                 c_right = float(corr_surface[peak_y, peak_x + 1])
                 denom = 2.0 * (c_left - 2 * c_center + c_right)
-                if abs(denom) > 1e-10:
+                if abs(denom) > 1e-6 * (abs(c_left) + abs(c_center) + abs(c_right) + 1e-10):
                     sub_x = peak_x + (c_left - c_right) / denom
 
             if 1 <= peak_y <= h - 2:
@@ -433,8 +463,12 @@ class DICEngine:
                 c_center = float(corr_surface[peak_y, peak_x])
                 c_bottom = float(corr_surface[peak_y + 1, peak_x])
                 denom = 2.0 * (c_top - 2 * c_center + c_bottom)
-                if abs(denom) > 1e-10:
+                if abs(denom) > 1e-6 * (abs(c_top) + abs(c_center) + abs(c_bottom) + 1e-10):
                     sub_y = peak_y + (c_top - c_bottom) / denom
+
+            # Clamp sub-pixel offset to at most +/-0.5 pixels
+            sub_x = np.clip(sub_x, peak_x - 0.5, peak_x + 0.5)
+            sub_y = np.clip(sub_y, peak_y - 0.5, peak_y + 0.5)
 
         elif self.params.subpixel_method == SubPixelMethod.GAUSSIAN:
             # 3-point Gaussian fit – requires all 3 values > 0.
@@ -451,13 +485,13 @@ class DICEngine:
                     ln_center = np.log(c_center)
                     ln_right = np.log(c_right)
                     denom = 2.0 * (ln_left - 2 * ln_center + ln_right)
-                    if abs(denom) > 1e-10:
+                    if abs(denom) > 1e-6 * (abs(ln_left) + abs(ln_center) + abs(ln_right) + 1e-10):
                         sub_x = peak_x + (ln_left - ln_right) / denom
                         _gauss_ok_x = True
                 if not _gauss_ok_x:
                     # Fallback: parabolic fit for X
                     denom = 2.0 * (c_left - 2 * c_center + c_right)
-                    if abs(denom) > 1e-10:
+                    if abs(denom) > 1e-6 * (abs(c_left) + abs(c_center) + abs(c_right) + 1e-10):
                         sub_x = peak_x + (c_left - c_right) / denom
 
             if 1 <= peak_y <= h - 2:
@@ -469,14 +503,18 @@ class DICEngine:
                     ln_center = np.log(c_center)
                     ln_bottom = np.log(c_bottom)
                     denom = 2.0 * (ln_top - 2 * ln_center + ln_bottom)
-                    if abs(denom) > 1e-10:
+                    if abs(denom) > 1e-6 * (abs(ln_top) + abs(ln_center) + abs(ln_bottom) + 1e-10):
                         sub_y = peak_y + (ln_top - ln_bottom) / denom
                         _gauss_ok_y = True
                 if not _gauss_ok_y:
                     # Fallback: parabolic fit for Y
                     denom = 2.0 * (c_top - 2 * c_center + c_bottom)
-                    if abs(denom) > 1e-10:
+                    if abs(denom) > 1e-6 * (abs(c_top) + abs(c_center) + abs(c_bottom) + 1e-10):
                         sub_y = peak_y + (c_top - c_bottom) / denom
+
+            # Clamp sub-pixel offset to at most +/-0.5 pixels
+            sub_x = np.clip(sub_x, peak_x - 0.5, peak_x + 0.5)
+            sub_y = np.clip(sub_y, peak_y - 0.5, peak_y + 0.5)
 
         elif self.params.subpixel_method == SubPixelMethod.BICUBIC:
             # Bicubic interpolation on 5x5 neighborhood
@@ -586,6 +624,10 @@ class DICEngine:
         quality = np.full((ny, nx), np.nan, dtype=np.float64)
 
         for iy in range(ny):
+            with self._lock:
+                cancelled = self._cancelled
+            if cancelled:
+                break
             for ix in range(nx):
                 if np.isnan(u[iy, ix]):
                     continue
@@ -662,7 +704,9 @@ class DICEngine:
             phase_cross_correlation = None
 
         for iy in range(ny):
-            if self._cancelled:
+            with self._lock:
+                cancelled = self._cancelled
+            if cancelled:
                 break
             for ix in range(nx):
                 cy, cx = gy[iy], gx[ix]
@@ -801,7 +845,9 @@ class DICEngine:
         pts_def = np.array([kp_def[m.trainIdx].pt for m in good_matches])
         disp_u = pts_def[:, 0] - pts_ref[:, 0]
         disp_v = pts_def[:, 1] - pts_ref[:, 1]
-        match_quality = np.array([1.0 - m.distance / 500.0 for m in good_matches])
+        max_dist = max(m.distance for m in good_matches) if good_matches else 1.0
+        max_dist = max(max_dist, 1.0)  # avoid division by zero
+        match_quality = np.array([1.0 - m.distance / max_dist for m in good_matches])
         match_quality = np.clip(match_quality, 0, 1)
 
         self._report_progress(60, "Interpolating to grid...")
@@ -818,10 +864,11 @@ class DICEngine:
         grid_x, grid_y = np.meshgrid(gx, gy)
 
         # Interpolate displacement fields
+        interp_method = 'cubic' if len(good_matches) >= 20 else 'linear'
         try:
-            u = griddata(pts_ref, disp_u, (grid_x, grid_y), method='cubic')
-            v = griddata(pts_ref, disp_v, (grid_x, grid_y), method='cubic')
-            q = griddata(pts_ref, match_quality, (grid_x, grid_y), method='cubic')
+            u = griddata(pts_ref, disp_u, (grid_x, grid_y), method=interp_method)
+            v = griddata(pts_ref, disp_v, (grid_x, grid_y), method=interp_method)
+            q = griddata(pts_ref, match_quality, (grid_x, grid_y), method=interp_method)
         except Exception:
             u = griddata(pts_ref, disp_u, (grid_x, grid_y), method='linear')
             v = griddata(pts_ref, disp_v, (grid_x, grid_y), method='linear')
@@ -969,14 +1016,23 @@ class DICSequenceRunner:
 
         cum_u = np.zeros_like(self.results[0].u)
         cum_v = np.zeros_like(self.results[0].v)
+        cum_weights = np.zeros_like(self.results[0].u)
         min_quality = np.ones_like(self.results[0].correlation_quality)
 
         for result in self.results:
             valid = ~np.isnan(result.u)
-            cum_u[valid] += result.u[valid]
-            cum_v[valid] += result.v[valid]
-            min_quality = np.minimum(min_quality,
-                                     np.nan_to_num(result.correlation_quality, nan=0))
+            q = np.nan_to_num(result.correlation_quality, nan=0)
+            mean_q = float(np.nanmean(q[valid])) if np.any(valid) else 0.5
+            weight = max(mean_q, 0.1)  # floor to avoid zero weight
+            cum_u[valid] += result.u[valid] * weight
+            cum_v[valid] += result.v[valid] * weight
+            cum_weights[valid] += weight
+            min_quality = np.minimum(min_quality, q)
+
+        # Normalize by cumulative weights
+        nonzero = cum_weights > 0
+        cum_u[nonzero] /= cum_weights[nonzero]
+        cum_v[nonzero] /= cum_weights[nonzero]
 
         cum_magnitude = compute_magnitude(cum_u, cum_v)
         mask_valid = ~np.isnan(cum_u)

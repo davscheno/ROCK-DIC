@@ -183,8 +183,15 @@ class DisplacementSmoother:
         u_local_mad = _nan_safe_local_mad(u, u_local_med, size=window_size)
         v_local_mad = _nan_safe_local_mad(v, v_local_med, size=window_size)
 
-        # Floor to avoid division by zero in uniform fields
-        mad_floor = 0.1
+        # Adaptive MAD floor: use 1% of displacement range or 0.05, whichever is larger
+        valid_u = u[~np.isnan(u)]
+        valid_v = v[~np.isnan(v)]
+        if len(valid_u) > 0:
+            u_range = np.ptp(valid_u)
+            v_range = np.ptp(valid_v) if len(valid_v) > 0 else u_range
+            mad_floor = max(0.05, min(u_range, v_range) * 0.01)
+        else:
+            mad_floor = 0.1
         u_local_mad = np.maximum(u_local_mad, mad_floor)
         v_local_mad = np.maximum(v_local_mad, mad_floor)
 
@@ -283,8 +290,24 @@ class StrainCalculator:
             'principal_angle' : Principal direction (radians)
             'von_mises' : Von Mises equivalent strain
         """
-        du_dy, du_dx = np.gradient(u, grid_spacing)
-        dv_dy, dv_dx = np.gradient(v, grid_spacing)
+        # NaN-safe gradient computation: interpolate gaps before computing derivatives
+        u_filled = u.copy()
+        v_filled = v.copy()
+        nan_mask = np.isnan(u) | np.isnan(v)
+        if np.any(nan_mask) and not np.all(nan_mask):
+            from scipy.interpolate import griddata as _griddata
+            valid = ~nan_mask
+            rows, cols = np.where(valid)
+            nan_rows, nan_cols = np.where(nan_mask)
+            if len(rows) >= 3 and len(nan_rows) > 0:
+                u_filled[nan_mask] = _griddata(
+                    np.column_stack([rows, cols]), u[valid],
+                    np.column_stack([nan_rows, nan_cols]), method='nearest')
+                v_filled[nan_mask] = _griddata(
+                    np.column_stack([rows, cols]), v[valid],
+                    np.column_stack([nan_rows, nan_cols]), method='nearest')
+        du_dy, du_dx = np.gradient(u_filled, grid_spacing)
+        dv_dy, dv_dx = np.gradient(v_filled, grid_spacing)
 
         # ---- Engineering (small) strain ----
         eps_xx = du_dx
@@ -300,6 +323,10 @@ class StrainCalculator:
         E_xx = 0.5 * (F11 * F11 + F21 * F21 - 1.0)
         E_yy = 0.5 * (F12 * F12 + F22 * F22 - 1.0)
         E_xy = 0.5 * (F11 * F12 + F21 * F22)
+
+        # Restore NaN at originally invalid positions
+        for arr in [E_xx, E_yy, E_xy, eps_xx, eps_yy, gamma_xy]:
+            arr[nan_mask] = np.nan
 
         # ---- Principal strains ----
         principal_1, principal_2, max_shear, principal_angle = \
@@ -504,7 +531,8 @@ class DisplacementStatistics:
 
     @staticmethod
     def detect_active_zones(magnitude, threshold, min_area_px=100,
-                            quality=None, min_quality=0.0):
+                            quality=None, min_quality=0.0,
+                            morph_kernel_size=3):
         """Detect connected regions where displacement exceeds threshold.
 
         Applies morphological opening before connected-component analysis
@@ -542,7 +570,7 @@ class DisplacementStatistics:
         active[above_thresh] = 255
 
         # Morphological opening to remove isolated pixels / thin noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_kernel_size, morph_kernel_size))
         active = cv2.morphologyEx(active, cv2.MORPH_OPEN, kernel)
 
         # Connected components

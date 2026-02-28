@@ -459,8 +459,8 @@ class ImageRegistration:
         # --- Level 1: Coarse ECC at small resolution ---
         if max_dim > self._MAX_ECC_DIM:
             scale1 = self._MAX_ECC_DIM / max_dim
-            w1 = int(w * scale1)
-            h1 = int(h * scale1)
+            w1 = round(w * scale1)
+            h1 = round(h * scale1)
             ref_l1 = cv2.resize(ref, (w1, h1), interpolation=cv2.INTER_AREA)
             def_l1 = cv2.resize(deformed, (w1, h1), interpolation=cv2.INTER_AREA)
             mask_l1 = (cv2.resize(mask, (w1, h1), interpolation=cv2.INTER_NEAREST)
@@ -493,7 +493,8 @@ class ImageRegistration:
                 inputMask=mask_l1
             )
         except cv2.error as e:
-            raise RuntimeError(f"ECC non convergente (coarse): {e}")
+            logger.warning(f"ECC non convergente (coarse): {e}. Fallback a feature-based.")
+            return self._feature_based_align(ref, deformed, mask)
 
         if scale1 < 1.0:
             del ref_l1, def_l1, mask_l1
@@ -507,8 +508,8 @@ class ImageRegistration:
         # Only do L2 refinement if it's at a meaningfully higher
         # resolution than L1 (at least 20% more pixels on the long side)
         if scale2 > scale1 * 1.2:
-            w2 = int(w * scale2)
-            h2 = int(h * scale2)
+            w2 = round(w * scale2)
+            h2 = round(h * scale2)
             ref_l2 = cv2.resize(ref, (w2, h2), interpolation=cv2.INTER_AREA)
             def_l2 = cv2.resize(deformed, (w2, h2), interpolation=cv2.INTER_AREA)
             mask_l2 = (cv2.resize(mask, (w2, h2), interpolation=cv2.INTER_NEAREST)
@@ -626,8 +627,8 @@ class ImageRegistration:
         # Downscale for FFT (large float64 arrays)
         if max_dim > self._MAX_ECC_DIM:
             scale = self._MAX_ECC_DIM / max_dim
-            new_w = int(w * scale)
-            new_h = int(h * scale)
+            new_w = round(w * scale)
+            new_h = round(h * scale)
             ref_small = cv2.resize(ref, (new_w, new_h), interpolation=cv2.INTER_AREA)
             def_small = cv2.resize(deformed, (new_w, new_h), interpolation=cv2.INTER_AREA)
         else:
@@ -650,6 +651,15 @@ class ImageRegistration:
 
         # Rescale shift to full resolution
         dx, dy = shift[0] / scale, shift[1] / scale
+
+        # Validate shift is within plausible range (half image dimensions)
+        max_shift_x, max_shift_y = w / 2, h / 2
+        if abs(dx) > max_shift_x or abs(dy) > max_shift_y:
+            logger.warning(
+                f"Phase shift implausibly large: ({dx:.1f}, {dy:.1f}) px "
+                f"vs image size {w}x{h}. Clamping to ±half image size.")
+            dx = np.clip(dx, -max_shift_x, max_shift_x)
+            dy = np.clip(dy, -max_shift_y, max_shift_y)
 
         self._report(60, "Applicazione traslazione...")
 
@@ -738,7 +748,7 @@ class ImageRegistration:
             projected = (M @ src_h.T).T
 
         errors = np.sqrt(np.sum((projected - dst) ** 2, axis=1))
-        return float(np.mean(errors))
+        return float(np.median(errors))
 
     @staticmethod
     def _compute_valid_crop(warped: np.ndarray,

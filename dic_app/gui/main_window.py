@@ -450,6 +450,7 @@ class DICMainWindow(QMainWindow):
         if self.project.images_data:
             self.image_list.setCurrentRow(0)
             self._update_status(f"{len(self.project.images_data)} immagini caricate")
+            logger.info(f"Loaded {len(self.project.images_data)} images")
 
     def _remove_image(self):
         """Remove selected image."""
@@ -802,6 +803,14 @@ class DICMainWindow(QMainWindow):
                 QMessageBox.information(
                     self, "Nota sulla texture", tex_check['warning'])
 
+        logger.info(
+            f"Starting DIC analysis: method={params.method.value}, "
+            f"subset={params.subset_size}, step={params.step_size}, "
+            f"ref={ref_image.shape}, def={def_image.shape}")
+
+        # Clear previous results to free memory
+        self.project.results = []
+
         # Setup engine and worker
         engine = DICEngine(params)
 
@@ -836,11 +845,13 @@ class DICMainWindow(QMainWindow):
         self.progress_bar.setValue(percent)
         self.progress_label.setText(message)
         self.analysis_log.append(f"[{percent:3d}%] {message}")
-        QApplication.processEvents()
 
     def _on_analysis_finished(self, result: DICResult):
         """Handle analysis completion."""
         self.project.results = [result]
+        logger.info(
+            f"Analysis completed: {result.computation_time_s:.1f}s, "
+            f"valid={int(np.sum(result.mask_valid))}/{result.mask_valid.size}")
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.progress_bar.setValue(100)
@@ -870,13 +881,28 @@ class DICMainWindow(QMainWindow):
         # Auto-switch to results tab (index 6 with alignment tab)
         self.tabs.setCurrentIndex(6)
         self._update_status("Analisi completata - visualizzazione risultati")
+        # Clean up worker and thread to prevent memory leaks
+        if self._worker_thread is not None:
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
+        if hasattr(self, '_worker') and self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
 
     def _on_analysis_error(self, error_msg):
+        logger.error(f"Analysis failed: {error_msg}")
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.progress_label.setText(f"Errore: {error_msg}")
         self.analysis_log.append(f"\nERRORE: {error_msg}")
         QMessageBox.critical(self, "Errore Analisi", error_msg)
+        # Clean up worker and thread to prevent memory leaks
+        if self._worker_thread is not None:
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
+        if hasattr(self, '_worker') and self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
 
     # ------------------------------------------------------------------
     # Report
@@ -944,6 +970,7 @@ class DICMainWindow(QMainWindow):
         generator.set_progress_callback(on_progress)
 
         try:
+            logger.info(f"Generating report to: {config.get('output_dir', '.')}")
             generator.generate_all()
             self._on_report_finished()
         except Exception as e:

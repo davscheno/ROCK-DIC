@@ -1,11 +1,14 @@
 """ROI and mask management for DIC analysis regions."""
 
+import logging
 import json
 import numpy as np
 import cv2
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class ROIType(Enum):
@@ -71,8 +74,15 @@ class MaskManager:
         self.rois: List[ROIDefinition] = []
 
     def add_roi(self, roi: ROIDefinition):
-        """Add an ROI definition."""
+        """Add an ROI definition after validation."""
+        if not roi.points or len(roi.points) < 2:
+            logger.warning(f"ROI '{roi.name}' has too few points ({len(roi.points) if roi.points else 0}), skipping")
+            return
+        if roi.roi_type in (ROIType.POLYGON, ROIType.FREEHAND) and len(roi.points) < 3:
+            logger.warning(f"Polygon/freehand ROI '{roi.name}' needs at least 3 points, skipping")
+            return
         self.rois.append(roi)
+        logger.debug(f"Added ROI '{roi.name}' ({roi.roi_type.value}, {roi.mode.value}, {len(roi.points)} points)")
 
     def remove_roi(self, index: int):
         """Remove ROI by index."""

@@ -8,6 +8,9 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import pyqtSignal, Qt
 from dic_app.core.dic_engine import DICParameters, DICMethod, SubPixelMethod
+from dic_app.utils.helpers import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class ParamsPanelWidget(QWidget):

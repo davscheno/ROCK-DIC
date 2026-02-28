@@ -13,6 +13,9 @@ from dic_app.gui.image_viewer import ImageViewer
 from dic_app.core.mask_manager import (
     MaskManager, ROIDefinition, ROIType, ROIMode
 )
+from dic_app.utils.helpers import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class ROIEditorWidget(QWidget):
