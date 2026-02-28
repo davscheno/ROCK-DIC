@@ -49,7 +49,7 @@ class ImageViewer(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setMouseTracking(True)
-        self.setStyleSheet("background-color: #2b2b2b;")
+        self.setStyleSheet("background-color: #e0e0e0;")
 
     def set_image(self, image):
         """Display a numpy array image (H,W) grayscale or (H,W,3) RGB uint8."""

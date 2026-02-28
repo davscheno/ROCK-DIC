@@ -303,7 +303,7 @@ class DICMainWindow(QMainWindow):
         self.analysis_log = QTextEdit()
         self.analysis_log.setReadOnly(True)
         self.analysis_log.setStyleSheet(
-            "font-family: monospace; font-size: 11px; background: #1e1e1e; color: #e0e0e0;")
+            "font-family: monospace; font-size: 11px; background: #fafafa; color: #212121;")
         log_layout.addWidget(self.analysis_log)
         layout.addWidget(log_group, stretch=1)
 
@@ -670,6 +670,10 @@ class DICMainWindow(QMainWindow):
             ref = self.project.get_reference_image()
             if ref is not None:
                 self.params_panel.update_estimation(ref.shape)
+                # Pass images for auto-guess
+                def_idx = self.deformed_combo.currentData()
+                def_img = self.project.get_deformed_image(def_idx)
+                self.params_panel.set_images_for_guess(ref, def_img)
             elif self.project.images_data:
                 shape = self.project.images_data[0].image_gray.shape
                 self.params_panel.update_estimation(shape)

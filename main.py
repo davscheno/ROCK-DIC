@@ -28,56 +28,109 @@ def main():
     app.setOrganizationName("DIC_frane")
     app.setApplicationVersion("1.0.0")
 
-    # Application-wide dark stylesheet
+    # Application-wide light stylesheet
     app.setStyleSheet("""
         QMainWindow {
-            background-color: #2b2b2b;
+            background-color: #f5f5f5;
+            color: #212121;
         }
         QWidget {
             font-size: 12px;
+            color: #212121;
         }
         QGroupBox {
             font-weight: bold;
-            border: 1px solid #555;
+            border: 1px solid #bdbdbd;
             border-radius: 4px;
             margin-top: 8px;
             padding-top: 16px;
+            background-color: #ffffff;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             left: 10px;
             padding: 0 5px;
+            color: #37474f;
         }
         QTabWidget::pane {
-            border: 1px solid #555;
+            border: 1px solid #bdbdbd;
             border-radius: 4px;
+            background-color: #ffffff;
         }
         QTabBar::tab {
             padding: 8px 16px;
             margin-right: 2px;
-            border: 1px solid #555;
+            border: 1px solid #bdbdbd;
             border-bottom: none;
             border-top-left-radius: 4px;
             border-top-right-radius: 4px;
+            background-color: #e0e0e0;
+            color: #424242;
         }
         QTabBar::tab:selected {
-            background-color: #3d3d3d;
+            background-color: #ffffff;
             font-weight: bold;
+            color: #1565c0;
         }
         QProgressBar {
-            border: 1px solid #555;
+            border: 1px solid #bdbdbd;
             border-radius: 4px;
             text-align: center;
+            background-color: #e0e0e0;
         }
         QProgressBar::chunk {
             background-color: #4CAF50;
             border-radius: 3px;
         }
         QToolTip {
-            background-color: #3d3d3d;
-            color: #e0e0e0;
-            border: 1px solid #555;
+            background-color: #fffde7;
+            color: #212121;
+            border: 1px solid #bdbdbd;
             padding: 4px;
+        }
+        QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
+            background-color: #ffffff;
+            border: 1px solid #bdbdbd;
+            border-radius: 3px;
+            padding: 3px;
+            color: #212121;
+        }
+        QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+            border: 1px solid #1565c0;
+        }
+        QPushButton {
+            background-color: #e0e0e0;
+            border: 1px solid #bdbdbd;
+            border-radius: 4px;
+            padding: 5px 12px;
+            color: #212121;
+        }
+        QPushButton:hover {
+            background-color: #d0d0d0;
+        }
+        QPushButton:pressed {
+            background-color: #bdbdbd;
+        }
+        QTableWidget {
+            background-color: #ffffff;
+            gridline-color: #e0e0e0;
+            color: #212121;
+        }
+        QHeaderView::section {
+            background-color: #e8eaf6;
+            color: #212121;
+            border: 1px solid #bdbdbd;
+            padding: 4px;
+            font-weight: bold;
+        }
+        QScrollBar:vertical {
+            background-color: #f5f5f5;
+            width: 12px;
+        }
+        QScrollBar::handle:vertical {
+            background-color: #bdbdbd;
+            border-radius: 4px;
+            min-height: 20px;
         }
     """)
 

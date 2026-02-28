@@ -76,7 +76,7 @@ class ResultsViewerWidget(QWidget):
         # Point info panel
         self.info_label = QLabel("Clicca su un punto per visualizzare i dati")
         self.info_label.setStyleSheet(
-            "background-color: #1e1e1e; color: #e0e0e0; padding: 8px; "
+            "background-color: #e8eaf6; color: #212121; padding: 8px; "
             "font-family: monospace; font-size: 11px;")
         self.info_label.setMinimumHeight(80)
         self.info_label.setWordWrap(True)
@@ -177,7 +177,7 @@ class ResultsViewerWidget(QWidget):
         self.sel_info_label = QLabel("Traccia un rettangolo sulla mappa per estrarre "
                                      "le porzioni di immagine riferimento e deformata.")
         self.sel_info_label.setWordWrap(True)
-        self.sel_info_label.setStyleSheet("font-size: 10px; color: #888;")
+        self.sel_info_label.setStyleSheet("font-size: 10px; color: #616161;")
         sel_layout.addWidget(self.sel_info_label)
 
         right_panel.addWidget(sel_group)
@@ -361,7 +361,7 @@ class ResultsViewerWidget(QWidget):
         hist_layout = QVBoxLayout(hist_group)
         hist_layout.setContentsMargins(2, 2, 2, 2)
         self._hist_figure = Figure(figsize=(3.5, 2.0), dpi=80)
-        self._hist_figure.patch.set_facecolor('#2b2b2b')
+        self._hist_figure.patch.set_facecolor('#ffffff')
         self._hist_canvas = FigureCanvas(self._hist_figure)
         self._hist_canvas.setMinimumHeight(140)
         self._hist_canvas.setMaximumHeight(180)
@@ -881,12 +881,12 @@ class ResultsViewerWidget(QWidget):
         """Draw magnitude histogram with noise level and threshold lines."""
         self._hist_figure.clear()
         ax = self._hist_figure.add_subplot(111)
-        ax.set_facecolor('#1e1e1e')
+        ax.set_facecolor('#fafafa')
 
         valid = magnitude[~np.isnan(magnitude)]
         if len(valid) < 5:
             ax.text(0.5, 0.5, "Dati insufficienti", ha='center', va='center',
-                    color='#888', transform=ax.transAxes)
+                    color='#757575', transform=ax.transAxes)
             self._hist_canvas.draw_idle()
             return
 
@@ -912,13 +912,13 @@ class ResultsViewerWidget(QWidget):
                    label=f'Soglia: {threshold:.2f} px')
 
         ax.legend(fontsize=7, loc='upper right',
-                  facecolor='#333', edgecolor='#555',
-                  labelcolor='#e0e0e0')
-        ax.set_xlabel('Magnitudine (px)', fontsize=8, color='#ccc')
-        ax.set_ylabel('Densita', fontsize=8, color='#ccc')
-        ax.tick_params(labelsize=7, colors='#aaa')
+                  facecolor='#ffffff', edgecolor='#bdbdbd',
+                  labelcolor='#212121')
+        ax.set_xlabel('Magnitudine (px)', fontsize=8, color='#424242')
+        ax.set_ylabel('Densita', fontsize=8, color='#424242')
+        ax.tick_params(labelsize=7, colors='#616161')
         for spine in ax.spines.values():
-            spine.set_color('#555')
+            spine.set_color('#bdbdbd')
 
         self._hist_figure.tight_layout(pad=0.5)
         self._hist_canvas.draw_idle()
@@ -1024,12 +1024,12 @@ class ResultsViewerWidget(QWidget):
         if enabled:
             self.sel_info_label.setText(
                 "Modalita selezione ATTIVA – trascina un rettangolo sulla mappa.")
-            self.sel_info_label.setStyleSheet("font-size: 10px; color: #FF5722;")
+            self.sel_info_label.setStyleSheet("font-size: 10px; color: #d84315; font-weight: bold;")
         else:
             self.sel_info_label.setText(
                 "Traccia un rettangolo sulla mappa per estrarre "
                 "le porzioni di immagine riferimento e deformata.")
-            self.sel_info_label.setStyleSheet("font-size: 10px; color: #888;")
+            self.sel_info_label.setStyleSheet("font-size: 10px; color: #616161;")
             # Restore heatmap overlay without selection rectangle
             self._update_display()
 
@@ -1384,7 +1384,7 @@ class AreaInspectionDialog(QDialog):
         info_label = QLabel(info)
         info_label.setStyleSheet(
             "font-weight: bold; font-size: 11px; padding: 4px; "
-            "background-color: #333; color: #e0e0e0;")
+            "background-color: #e3f2fd; color: #1565c0;")
         info_label.setAlignment(Qt.AlignCenter)
         info_label.setMaximumHeight(28)
         layout.addWidget(info_label)
@@ -1660,7 +1660,7 @@ class ZoneValidationDialog(QDialog):
         # --- Zone info panel ---
         self.info_label = QLabel()
         self.info_label.setStyleSheet(
-            "background-color: #333; color: #e0e0e0; padding: 5px; "
+            "background-color: #e8eaf6; color: #212121; padding: 5px; "
             "font-size: 11px; font-family: monospace;")
         self.info_label.setWordWrap(True)
         self.info_label.setMaximumHeight(55)
@@ -1707,7 +1707,7 @@ class ZoneValidationDialog(QDialog):
         self.summary_label.setAlignment(Qt.AlignCenter)
         self.summary_label.setStyleSheet(
             "font-size: 12px; padding: 4px; "
-            "background-color: #2b2b2b; color: #ccc;")
+            "background-color: #e8eaf6; color: #37474f;")
         layout.addWidget(self.summary_label)
 
         # --- Bottom buttons ---
@@ -1716,7 +1716,7 @@ class ZoneValidationDialog(QDialog):
         help_label = QLabel(
             "Scorciatoie: V=Valida  R=Rifiuta  "
             "Frecce=Naviga  Spazio=Salta")
-        help_label.setStyleSheet("font-size: 10px; color: #888;")
+        help_label.setStyleSheet("font-size: 10px; color: #616161;")
         bottom_row.addWidget(help_label)
 
         bottom_row.addStretch()
@@ -2057,7 +2057,7 @@ class GridInspectionDialog(QDialog):
         self.info_label = QLabel()
         self.info_label.setAlignment(Qt.AlignCenter)
         self.info_label.setStyleSheet(
-            "background-color: #333; color: #e0e0e0; padding: 5px; "
+            "background-color: #e3f2fd; color: #1565c0; padding: 5px; "
             "font-size: 11px;")
         self.info_label.setMaximumHeight(28)
         layout.addWidget(self.info_label)
@@ -2108,7 +2108,7 @@ class GridInspectionDialog(QDialog):
         self.summary_label.setAlignment(Qt.AlignCenter)
         self.summary_label.setStyleSheet(
             "font-size: 12px; padding: 4px; "
-            "background-color: #2b2b2b; color: #ccc;")
+            "background-color: #e8eaf6; color: #37474f;")
         layout.addWidget(self.summary_label)
 
         # --- Bottom: shortcuts + Accept/Cancel ---
@@ -2117,7 +2117,7 @@ class GridInspectionDialog(QDialog):
         help_label = QLabel(
             "D/Invio=Deformata  N=Normale  "
             "Frecce=Naviga  Spazio=Salta")
-        help_label.setStyleSheet("font-size: 10px; color: #888;")
+        help_label.setStyleSheet("font-size: 10px; color: #616161;")
         bottom_row.addWidget(help_label)
 
         bottom_row.addStretch()

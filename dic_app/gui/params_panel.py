@@ -1,11 +1,12 @@
 """DIC algorithm parameter configuration panel."""
 
+import numpy as np
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
-    QStackedWidget, QFormLayout
+    QStackedWidget, QFormLayout, QMessageBox, QTextBrowser
 )
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import pyqtSignal, Qt
 from dic_app.core.dic_engine import DICParameters, DICMethod, SubPixelMethod
 
 
@@ -20,6 +21,9 @@ class ParamsPanelWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._ref_image = None       # stored for auto-guess
+        self._def_image = None       # stored for auto-guess
+        self._image_shape = None
         self._setup_ui()
         self._connect_signals()
 
@@ -39,10 +43,35 @@ class ParamsPanelWidget(QWidget):
 
         self.method_desc = QLabel()
         self.method_desc.setWordWrap(True)
-        self.method_desc.setStyleSheet("color: #888; font-style: italic;")
+        self.method_desc.setStyleSheet("color: #546e7a; font-style: italic;")
         algo_layout.addRow(self.method_desc)
 
         main_layout.addWidget(algo_group)
+
+        # --- Guide & Auto-guess buttons ---
+        guide_row = QHBoxLayout()
+
+        self.btn_guide = QPushButton("Guida Scelta Algoritmo")
+        self.btn_guide.setStyleSheet(
+            "QPushButton { background-color: #1565c0; color: white; "
+            "padding: 6px 14px; font-weight: bold; }")
+        self.btn_guide.setToolTip(
+            "Mostra una guida interattiva per scegliere l'algoritmo DIC "
+            "e i parametri ottimali per il tuo caso d'uso.")
+        self.btn_guide.clicked.connect(self._show_algorithm_guide)
+        guide_row.addWidget(self.btn_guide)
+
+        self.btn_auto_guess = QPushButton("Auto-Stima Parametri")
+        self.btn_auto_guess.setStyleSheet(
+            "QPushButton { background-color: #ff8f00; color: white; "
+            "padding: 6px 14px; font-weight: bold; }")
+        self.btn_auto_guess.setToolTip(
+            "Analizza le immagini caricate e propone automaticamente "
+            "algoritmo e parametri ottimali.")
+        self.btn_auto_guess.clicked.connect(self._auto_guess_parameters)
+        guide_row.addWidget(self.btn_auto_guess)
+
+        main_layout.addLayout(guide_row)
 
         # --- Common parameters ---
         common_group = QGroupBox("Parametri Comuni")
@@ -296,6 +325,7 @@ class ParamsPanelWidget(QWidget):
         """Update computation estimation based on image size and parameters."""
         if image_shape is None:
             return
+        self._image_shape = image_shape
         h, w = image_shape[:2]
         params = self.get_parameters()
         half = params.subset_size // 2
@@ -308,3 +338,306 @@ class ParamsPanelWidget(QWidget):
             f"Punti griglia: {nx} x {ny} = {total:,} punti\n"
             f"Subset: {params.subset_size} x {params.subset_size} pixel"
         )
+
+    def set_images_for_guess(self, ref_gray, def_gray):
+        """Store reference/deformed images for auto-parameter estimation."""
+        self._ref_image = ref_gray
+        self._def_image = def_gray
+        if ref_gray is not None:
+            self._image_shape = ref_gray.shape
+
+    # ------------------------------------------------------------------
+    # Algorithm Guide
+    # ------------------------------------------------------------------
+
+    def _show_algorithm_guide(self):
+        """Show interactive algorithm selection guide dialog."""
+        guide_html = """
+        <h2 style="color: #1565c0;">Guida alla Scelta dell'Algoritmo DIC</h2>
+
+        <h3>1. Template Matching NCC</h3>
+        <p><b>Quando usarlo:</b> Piccoli spostamenti (1-50 pixel), buona texture
+        superficiale, roccia con pattern visibili, vegetazione, terreno con
+        granulometria variabile.</p>
+        <p><b>Vantaggi:</b> Massima precisione sub-pixel (fino a 0.01 px),
+        misura affidabile della qualita tramite NCC.</p>
+        <p><b>Svantaggi:</b> Lento per grandi immagini, limitato dal raggio di
+        ricerca impostato.</p>
+        <p><b>Parametri chiave:</b></p>
+        <ul>
+        <li><b>Subset</b>: 21-41 px per buona texture, 51-81 px per texture scarsa</li>
+        <li><b>Raggio ricerca</b>: impostare >= spostamento atteso massimo</li>
+        <li><b>Sub-pixel</b>: Gaussiano (veloce e preciso)</li>
+        </ul>
+        <hr>
+
+        <h3>2. Optical Flow (Farneback)</h3>
+        <p><b>Quando usarlo:</b> Spostamenti moderati (5-200 pixel), serve una
+        mappa densa e veloce, analisi preliminare rapida.</p>
+        <p><b>Vantaggi:</b> Molto veloce, produce campo denso pixel-per-pixel,
+        gestisce spostamenti grandi tramite piramidi.</p>
+        <p><b>Svantaggi:</b> Meno preciso in sub-pixel rispetto a NCC,
+        sensibile a variazioni di illuminazione.</p>
+        <p><b>Parametri chiave:</b></p>
+        <ul>
+        <li><b>Livelli piramide</b>: 3-5 per spostamenti piccoli, 6-8 per grandi</li>
+        <li><b>Dim. finestra</b>: 15-21 px (piu grande = piu robusto)</li>
+        <li><b>Iterazioni</b>: 3-5 (piu = piu preciso ma lento)</li>
+        </ul>
+        <hr>
+
+        <h3>3. Phase Correlation (FFT)</h3>
+        <p><b>Quando usarlo:</b> Traslazioni uniformi (frane con movimento rigido),
+        analisi rapida, spostamenti molto grandi.</p>
+        <p><b>Vantaggi:</b> Estremamente veloce, robusto al rumore,
+        insensibile a variazioni di illuminazione.</p>
+        <p><b>Svantaggi:</b> Funziona bene solo per traslazioni rigide
+        (non deformazioni complesse), precisione limitata per rotazioni.</p>
+        <p><b>Parametri chiave:</b></p>
+        <ul>
+        <li><b>Upsampling</b>: 20 per 1/20 pixel di precisione, 100 per 0.01 px</li>
+        <li><b>Subset</b>: 41-81 px (subset piu grandi = piu affidabile)</li>
+        </ul>
+        <hr>
+
+        <h3>4. Feature Matching (SIFT/ORB)</h3>
+        <p><b>Quando usarlo:</b> Spostamenti molto grandi (> 100 pixel),
+        texture scarsa, immagini con pochi punti di riferimento.</p>
+        <p><b>Vantaggi:</b> Nessun limite di spostamento, robusto a rotazioni
+        e scala, funziona con pochi punti di texture.</p>
+        <p><b>Svantaggi:</b> Risultato sparso (interpolato), meno preciso,
+        non adatto per piccoli spostamenti sub-pixel.</p>
+        <p><b>Parametri chiave:</b></p>
+        <ul>
+        <li><b>Max features</b>: 5000-20000 (piu = migliore copertura)</li>
+        <li><b>Ratio test</b>: 0.7-0.8 (piu basso = meno falsi positivi)</li>
+        </ul>
+        <hr>
+
+        <h3 style="color: #2e7d32;">Raccomandazione per Monitoraggio Frane/Falesie</h3>
+        <table border="1" cellpadding="6" cellspacing="0"
+               style="border-collapse: collapse; width: 100%;">
+        <tr style="background-color: #e8f5e9;">
+            <th>Scenario</th><th>Algoritmo</th><th>Motivazione</th>
+        </tr>
+        <tr>
+            <td>Distacchi massi da falesia</td>
+            <td><b>Template NCC</b></td>
+            <td>Massima precisione, texture rocciosa favorevole</td>
+        </tr>
+        <tr>
+            <td>Frana lenta (mm/anno)</td>
+            <td><b>Template NCC</b></td>
+            <td>Precisione sub-pixel critica per piccoli spostamenti</td>
+        </tr>
+        <tr>
+            <td>Frana rapida (m/evento)</td>
+            <td><b>Optical Flow</b></td>
+            <td>Veloce, gestisce grandi spostamenti</td>
+        </tr>
+        <tr>
+            <td>Analisi preliminare rapida</td>
+            <td><b>Optical Flow</b></td>
+            <td>Risultato in secondi per valutazione iniziale</td>
+        </tr>
+        <tr>
+            <td>Movimento rigido uniforme</td>
+            <td><b>Phase Correlation</b></td>
+            <td>Velocissimo per traslazioni pure</td>
+        </tr>
+        <tr>
+            <td>Immagini molto diverse</td>
+            <td><b>Feature Matching</b></td>
+            <td>Robusto a grandi differenze tra le immagini</td>
+        </tr>
+        </table>
+        """
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Guida Scelta Algoritmo DIC")
+        dialog.setTextFormat(Qt.RichText)
+        dialog.setText(guide_html)
+        dialog.setStandardButtons(QMessageBox.Ok)
+        dialog.setMinimumWidth(700)
+        dialog.exec()
+
+    # ------------------------------------------------------------------
+    # Auto-Guess Parameters
+    # ------------------------------------------------------------------
+
+    def _auto_guess_parameters(self):
+        """Analyze loaded images and suggest optimal DIC parameters."""
+        if self._ref_image is None or self._def_image is None:
+            QMessageBox.warning(
+                self, "Immagini non disponibili",
+                "Carica le immagini e seleziona riferimento/deformata "
+                "prima di usare l'auto-stima.")
+            return
+
+        try:
+            import cv2
+            ref = self._ref_image
+            deformed = self._def_image
+            h, w = ref.shape[:2]
+
+            # --- 1. Analyze texture quality ---
+            # Local variance as texture measure
+            blur = cv2.GaussianBlur(ref, (31, 31), 0).astype(np.float64)
+            sq_blur = cv2.GaussianBlur(
+                ref.astype(np.float64) ** 2, (31, 31), 0)
+            local_var = np.mean(sq_blur - blur ** 2)
+
+            # Gradient magnitude (Sobel)
+            gx = cv2.Sobel(ref, cv2.CV_64F, 1, 0, ksize=3)
+            gy = cv2.Sobel(ref, cv2.CV_64F, 0, 1, ksize=3)
+            mean_gradient = np.mean(np.sqrt(gx**2 + gy**2))
+
+            # Texture quality score (0-1)
+            texture_score = min(1.0, mean_gradient / 30.0)
+
+            # --- 2. Estimate displacement magnitude ---
+            # Quick optical flow for displacement estimation
+            flow = cv2.calcOpticalFlowFarneback(
+                ref, deformed, None,
+                pyr_scale=0.5, levels=3, winsize=15,
+                iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
+            flow_mag = np.sqrt(flow[:, :, 0]**2 + flow[:, :, 1]**2)
+
+            # Robust displacement estimate (95th percentile)
+            p95_disp = float(np.percentile(flow_mag, 95))
+            p99_disp = float(np.percentile(flow_mag, 99))
+            median_disp = float(np.median(flow_mag))
+
+            # --- 3. Choose algorithm ---
+            if p95_disp < 2.0 and texture_score > 0.3:
+                # Very small displacements, decent texture → NCC
+                method = DICMethod.TEMPLATE_NCC
+                method_reason = (
+                    "Spostamenti molto piccoli ({:.1f} px al 95%), "
+                    "texture sufficiente → Template NCC per massima "
+                    "precisione sub-pixel.".format(p95_disp))
+            elif p95_disp < 50 and texture_score > 0.2:
+                # Small-moderate displacements → NCC
+                method = DICMethod.TEMPLATE_NCC
+                method_reason = (
+                    "Spostamenti moderati ({:.1f} px al 95%), "
+                    "buona texture → Template NCC.".format(p95_disp))
+            elif p95_disp < 200:
+                # Large displacements → Optical Flow
+                method = DICMethod.OPTICAL_FLOW_FARNEBACK
+                method_reason = (
+                    "Spostamenti grandi ({:.1f} px al 95%) → "
+                    "Optical Flow per velocita e copertura densa."
+                    .format(p95_disp))
+            elif texture_score < 0.15:
+                # Very poor texture → Feature Matching
+                method = DICMethod.FEATURE_MATCHING
+                method_reason = (
+                    "Texture molto scarsa (score {:.2f}), spostamenti "
+                    "grandi → Feature Matching.".format(texture_score))
+            else:
+                # Very large displacements → Optical Flow
+                method = DICMethod.OPTICAL_FLOW_FARNEBACK
+                method_reason = (
+                    "Spostamenti molto grandi ({:.1f} px al 95%) → "
+                    "Optical Flow.".format(p95_disp))
+
+            # --- 4. Calculate optimal parameters ---
+            # Subset size: based on texture quality
+            if texture_score > 0.5:
+                subset = 21  # good texture
+            elif texture_score > 0.3:
+                subset = 31  # moderate texture
+            elif texture_score > 0.15:
+                subset = 51  # poor texture
+            else:
+                subset = 71  # very poor texture
+
+            # Ensure odd
+            if subset % 2 == 0:
+                subset += 1
+
+            # Ensure subset < image dimensions
+            subset = min(subset, min(h, w) // 4)
+            if subset % 2 == 0:
+                subset += 1
+
+            # Step size: ~1/3 to 1/2 of subset for good overlap
+            step = max(3, subset // 4)
+
+            # Search radius: based on displacement magnitude + margin
+            search_r = max(10, int(p99_disp * 1.5) + 10)
+            search_r = min(search_r, min(h, w) // 4)
+
+            # Correlation threshold
+            if texture_score > 0.4:
+                corr_thresh = 0.7  # high texture → strict
+            elif texture_score > 0.2:
+                corr_thresh = 0.6  # moderate → standard
+            else:
+                corr_thresh = 0.5  # low texture → relaxed
+
+            # Border margin
+            border = max(10, subset)
+
+            # OF levels based on displacement
+            of_levels = max(3, min(8, int(np.log2(max(1, p95_disp))) + 2))
+
+            # --- 5. Apply parameters ---
+            # Set method
+            for i in range(self.method_combo.count()):
+                if self.method_combo.itemData(i) == method:
+                    self.method_combo.setCurrentIndex(i)
+                    break
+
+            self.subset_spin.setValue(subset)
+            self.step_spin.setValue(step)
+            self.threshold_spin.setValue(corr_thresh)
+            self.border_margin_spin.setValue(border)
+            self.search_rx.setValue(search_r)
+            self.search_ry.setValue(search_r)
+            self.of_levels.setValue(of_levels)
+
+            # --- 6. Show summary ---
+            summary = (
+                f"<h3>Risultato Auto-Stima Parametri</h3>"
+                f"<p><b>Analisi immagine:</b></p>"
+                f"<ul>"
+                f"<li>Dimensione: {w} x {h} pixel</li>"
+                f"<li>Qualita texture: {texture_score:.2f} "
+                f"({'buona' if texture_score > 0.4 else 'moderata' if texture_score > 0.2 else 'scarsa'})</li>"
+                f"<li>Gradiente medio: {mean_gradient:.1f}</li>"
+                f"<li>Varianza locale: {local_var:.1f}</li>"
+                f"</ul>"
+                f"<p><b>Stima spostamento:</b></p>"
+                f"<ul>"
+                f"<li>Mediana: {median_disp:.1f} px</li>"
+                f"<li>95° percentile: {p95_disp:.1f} px</li>"
+                f"<li>99° percentile: {p99_disp:.1f} px</li>"
+                f"</ul>"
+                f"<p><b>Algoritmo scelto:</b> {method.value}</p>"
+                f"<p><i>{method_reason}</i></p>"
+                f"<p><b>Parametri impostati:</b></p>"
+                f"<ul>"
+                f"<li>Subset: {subset} px</li>"
+                f"<li>Passo griglia: {step} px</li>"
+                f"<li>Raggio ricerca: {search_r} px</li>"
+                f"<li>Soglia correlazione: {corr_thresh}</li>"
+                f"<li>Margine bordi: {border} px</li>"
+                f"</ul>"
+                f"<p style='color: #1565c0;'><b>Nota:</b> Questi parametri "
+                f"sono un punto di partenza. Regola manualmente in base "
+                f"ai risultati ottenuti.</p>"
+            )
+
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Auto-Stima Parametri DIC")
+            msg.setTextFormat(Qt.RichText)
+            msg.setText(summary)
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec()
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Errore Auto-Stima",
+                f"Errore durante l'analisi automatica:\n{e}")

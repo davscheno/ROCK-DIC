@@ -206,7 +206,7 @@ class FilterPanelWidget(QWidget):
         auto_layout.addWidget(self.btn_auto)
 
         self.auto_progress = QLabel("")
-        self.auto_progress.setStyleSheet("font-size: 11px; color: #666;")
+        self.auto_progress.setStyleSheet("font-size: 11px; color: #616161;")
         self.auto_progress.setWordWrap(True)
         auto_layout.addWidget(self.auto_progress)
 
