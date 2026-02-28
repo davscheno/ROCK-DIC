@@ -205,3 +205,26 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific: large image files
+*.jpeg
+*.jpg
+*.tif
+*.tiff
+*.png
+*.aux.xml
+
+# Project-specific: test/data directories
+area_1_test/
+Aree_diff_corr/
+areaanomale_camogli_2013-2024/
+report/
+
+# Archives
+*.zip
+
+# OS
+.DS_Store
+
+# Claude internal
+.claude/
