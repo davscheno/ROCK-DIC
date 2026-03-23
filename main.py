@@ -26,7 +26,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("DIC Landslide Monitor")
     app.setOrganizationName("DIC_frane")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("1.1.0")
 
     # Application-wide light stylesheet
     app.setStyleSheet("""
