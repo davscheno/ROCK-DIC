@@ -215,7 +215,7 @@ class ImageRegistration:
                                    borderValue=0)
         del ones
 
-        bbox = self._compute_valid_crop(warped, ref_gray.shape, vmask)
+        bbox = self.reference_crop_bbox(result, ref_gray.shape, vmask)
         del vmask
         x0, y0, x1, y1 = bbox
 
@@ -749,6 +749,61 @@ class ImageRegistration:
 
         errors = np.sqrt(np.sum((projected - dst) ** 2, axis=1))
         return float(np.median(errors))
+
+    @staticmethod
+    def warp_to_reference(image: np.ndarray, M: np.ndarray,
+                          ref_shape: tuple) -> Tuple[np.ndarray, np.ndarray]:
+        """Warp *image* into the reference frame.
+
+        Returns (warped, validity_mask) where both have the reference
+        (h, w) size and validity_mask is 255 inside the warped footprint.
+        """
+        h, w = ref_shape[:2]
+        src_h, src_w = image.shape[:2]
+        ones = np.full((src_h, src_w), 255, dtype=np.uint8)
+        if M.shape == (3, 3):
+            warped = cv2.warpPerspective(image, M, (w, h),
+                                         flags=cv2.INTER_LINEAR,
+                                         borderMode=cv2.BORDER_CONSTANT,
+                                         borderValue=0)
+            vmask = cv2.warpPerspective(ones, M, (w, h),
+                                        flags=cv2.INTER_NEAREST,
+                                        borderMode=cv2.BORDER_CONSTANT,
+                                        borderValue=0)
+        else:
+            M2x3 = M[:2]
+            warped = cv2.warpAffine(image, M2x3, (w, h),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT,
+                                    borderValue=0)
+            vmask = cv2.warpAffine(ones, M2x3, (w, h),
+                                   flags=cv2.INTER_NEAREST,
+                                   borderMode=cv2.BORDER_CONSTANT,
+                                   borderValue=0)
+        return warped, vmask
+
+    @staticmethod
+    def reference_crop_bbox(result: 'AlignmentResult', ref_shape: tuple,
+                            validity_mask: np.ndarray = None
+                            ) -> Tuple[int, int, int, int]:
+        """Crop box (x0, y0, x1, y1) that defines the aligned reference.
+
+        Uses the bbox stored in *result* (the one the alignment panel
+        used to build aligned_ref) so that every image cropped later
+        has exactly the same geometry.  Falls back to recomputing it
+        from the validity mask for legacy results without a bbox.
+        """
+        h, w = ref_shape[:2]
+        x0, y0, x1, y1 = (int(c) for c in result.crop_bbox)
+        if 0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h:
+            return (x0, y0, x1, y1)
+        if validity_mask is None:
+            M = result.transform_matrix
+            ones = np.full((h, w), 255, dtype=np.uint8)
+            _, validity_mask = ImageRegistration.warp_to_reference(
+                ones, M, (h, w))
+        return ImageRegistration._compute_valid_crop(
+            validity_mask, (h, w), validity_mask)
 
     @staticmethod
     def _compute_valid_crop(warped: np.ndarray,

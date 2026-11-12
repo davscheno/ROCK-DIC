@@ -228,3 +228,6 @@ report/
 
 # Claude internal
 .claude/
+
+TEST_Report/
+ritagli/

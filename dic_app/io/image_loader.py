@@ -10,6 +10,11 @@ from dic_app.utils.helpers import dms_to_decimal, setup_logger
 
 logger = setup_logger(__name__)
 
+# Pillow is used only to read EXIF metadata of local files chosen by the
+# user.  Its "decompression bomb" guard refuses images above ~179 MP (and
+# warns above ~89 MP), which blocks metadata of large orthophotos.
+Image.MAX_IMAGE_PIXELS = None
+
 
 @dataclass
 class GPSData:
@@ -39,6 +44,19 @@ class ImageData:
     focal_length_mm: Optional[float] = None
     capture_time: Optional[str] = None
     gsd: Optional[float] = None
+    # Set when the file is a preliminary crop (content of its .precrop.json)
+    precrop: Optional[dict] = field(default=None, repr=False)
+
+    @property
+    def original_width(self) -> int:
+        """Width of the ORIGINAL photo (before a preliminary crop).
+
+        GSD formulas relate the sensor width to the full photo width, so
+        they must not use the width of a crop.
+        """
+        if self.precrop and self.precrop.get('source_original_shape'):
+            return int(self.precrop['source_original_shape'][1])
+        return self.width
 
     @property
     def image_rgb(self) -> Optional[np.ndarray]:
@@ -109,6 +127,26 @@ class ImageLoader:
         gps_data = ImageLoader._extract_exif_gps(filepath)
         camera_info = ImageLoader._extract_camera_info(filepath)
 
+        gsd = ImageLoader._extract_geotiff_gsd(filepath)
+
+        # Preliminary crops (PNG) lose EXIF: recover it from the sidecar
+        from dic_app.core.precrop import read_sidecar
+        precrop = read_sidecar(filepath)
+        if precrop:
+            src_meta = precrop.get('source_metadata') or {}
+            g = src_meta.get('gps')
+            if gps_data is None and g and g.get('latitude') is not None:
+                gps_data = GPSData(latitude=g.get('latitude'),
+                                   longitude=g.get('longitude'),
+                                   altitude=g.get('altitude'),
+                                   timestamp=g.get('timestamp'))
+            for key in ('camera_model', 'focal_length', 'capture_time'):
+                if camera_info.get(key) is None and src_meta.get(key) is not None:
+                    camera_info[key] = src_meta[key]
+            # a crop has the pixel size of the GUIDE grid it was resampled to
+            if gsd is None and precrop.get('guide_gsd'):
+                gsd = float(precrop['guide_gsd'])
+
         img_data = ImageData(
             filepath=filepath,
             image_gray=image_gray,
@@ -118,6 +156,8 @@ class ImageLoader:
             camera_model=camera_info.get('camera_model'),
             focal_length_mm=camera_info.get('focal_length'),
             capture_time=camera_info.get('capture_time'),
+            precrop=precrop,
+            gsd=gsd,
         )
 
         logger.info(f"Loaded {img_data.filename} ({w}x{h})"
@@ -178,6 +218,26 @@ class ImageLoader:
         except Exception as e:
             logger.debug(f"No GPS EXIF data in {filepath}: {e}")
             return None
+
+    @staticmethod
+    def _extract_geotiff_gsd(filepath: str) -> Optional[float]:
+        """Pixel size from the GeoTIFF ModelPixelScale tag (33550), if any.
+
+        Only for projected CRSs in metres (the usual case for orthophotos);
+        values that look like degrees (< 1e-4) are ignored.
+        """
+        if os.path.splitext(filepath)[1].lower() not in ('.tif', '.tiff'):
+            return None
+        try:
+            with Image.open(filepath) as im:
+                scale = im.tag_v2.get(33550)
+            if scale and len(scale) >= 2:
+                sx, sy = float(scale[0]), float(scale[1])
+                if sx > 1e-4 and abs(sx - sy) / sx < 0.01:
+                    return sx
+        except Exception as e:
+            logger.debug(f"No GeoTIFF pixel scale in {filepath}: {e}")
+        return None
 
     @staticmethod
     def _extract_camera_info(filepath: str) -> dict:

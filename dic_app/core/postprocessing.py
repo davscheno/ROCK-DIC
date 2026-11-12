@@ -133,13 +133,11 @@ class DisplacementSmoother:
         ----------
         kernel_size : int, filter window size
         """
-        nan_mask = np.isnan(u)
-        u_filled = np.nan_to_num(u, nan=0.0)
-        v_filled = np.nan_to_num(v, nan=0.0)
-
-        u_med = scipy_median_filter(u_filled, size=kernel_size)
-        v_med = scipy_median_filter(v_filled, size=kernel_size)
-
+        # NaN-safe: filling holes with 0 would drag neighbouring values
+        # towards zero displacement.
+        u_med = _nan_safe_median_filter(u, size=kernel_size)
+        v_med = _nan_safe_median_filter(v, size=kernel_size)
+        nan_mask = np.isnan(u) | np.isnan(v)
         u_med[nan_mask] = np.nan
         v_med[nan_mask] = np.nan
 
@@ -423,7 +421,12 @@ class DisplacementStatistics:
         valid_u = u[valid]
         valid_v = v[valid]
         directions = np.degrees(np.arctan2(-valid_v, valid_u)) % 360
-        stats['mean_direction_deg'] = float(np.mean(directions))
+        # Circular mean: average the unit vectors, not the angles
+        # (an arithmetic mean of 350 and 10 degrees would give 180).
+        rad = np.radians(directions)
+        mean_dir = float(np.degrees(np.arctan2(np.mean(np.sin(rad)),
+                                               np.mean(np.cos(rad)))) % 360)
+        stats['mean_direction_deg'] = 0.0 if mean_dir >= 360.0 - 1e-9 else mean_dir
         stats['direction_histogram'] = np.histogram(
             directions, bins=36, range=(0, 360))[0].tolist()
 

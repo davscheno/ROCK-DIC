@@ -10,10 +10,56 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from dic_app.gui.image_viewer import ImageViewer
 from dic_app.core.preprocessing import FilterPipeline, FILTER_REGISTRY
-from dic_app.core.auto_filter import AutoFilterOptimizer, compute_quality_metrics
+from dic_app.core.filter_advisor import copy_pipeline
 from dic_app.utils.helpers import setup_logger
 
 logger = setup_logger(__name__)
+
+# Italian label, when to use it, and whether it is safe for DIC
+# (tested with known motions: the "not recommended" ones change grey
+# levels non-linearly and increase the DIC error).
+FILTER_INFO_IT = {
+    'Wallis Filter': ("Wallis - uniforma luce e contrasto locali",
+                      "Luce diversa tra le foto, ombre, parete bagnata. "
+                      "Finestra ~1.5 volte il subset.", True),
+    'CLAHE': ("CLAHE - contrasto locale adattivo",
+              "Foschia, contrasto basso, zone in ombra profonda.", True),
+    'Gaussian Blur': ("Gaussiano - attenua il rumore",
+                      "Foto rumorose. Usare sigma basso (0.6-1.4): troppo "
+                      "sfocato riduce la tessitura.", True),
+    'Non-Local Means': ("Non-Local Means - riduzione rumore forte (lento)",
+                        "Foto molto rumorose (notturne, ISO alti).", True),
+    'Bilateral Filter': ("Bilaterale - riduce il rumore preservando i bordi",
+                         "Rumore con bordi netti; nei test peggiora spesso "
+                         "la precisione.", True),
+    'Median Filter': ("Mediano - rimuove pixel isolati",
+                      "Solo per rumore impulsivo (pixel bianchi/neri).", True),
+    'Normalize Brightness': ("Normalizza luminosita' media",
+                             "Inutile per il DIC (gia' invariante alla "
+                             "luminosita'), utile solo per la visualizzazione.", True),
+    'Gamma Correction': ("Correzione gamma",
+                         "Immagini molto scure o chiare; preferire CLAHE.", True),
+    'Histogram Equalization': ("Equalizzazione istogramma globale",
+                               "SCONSIGLIATO per il DIC: altera i livelli di "
+                               "grigio, nei test perde fino al 70% dei punti.", False),
+    'Unsharp Mask': ("Nitidezza (unsharp mask)",
+                     "SCONSIGLIATO per il DIC: amplifica il rumore.", False),
+    'Laplacian Sharpening': ("Nitidezza laplaciana",
+                             "SCONSIGLIATO per il DIC: amplifica il rumore.", False),
+    'Adaptive Threshold Enhancement': ("Soglia adattiva",
+                                       "SCONSIGLIATO per il DIC: introduce "
+                                       "salti artificiali di grigio.", False),
+    'Morphological Opening': ("Apertura morfologica",
+                              "SCONSIGLIATO per il DIC: cancella dettagli "
+                              "della tessitura.", False),
+    'Morphological Closing': ("Chiusura morfologica",
+                              "SCONSIGLIATO per il DIC: cancella dettagli "
+                              "della tessitura.", False),
+}
+
+
+def filter_label(name):
+    return FILTER_INFO_IT.get(name, (name, "", True))[0]
 
 
 class FilterParamWidget(QFrame):
@@ -116,6 +162,9 @@ class FilterPanelWidget(QWidget):
         super().__init__(parent)
         self._reference_image = None
         self._all_images = []  # All loaded grayscale images for multi-image optimization
+        self._deformed_image = None   # raw deformed image for the guided choice
+        self._dic_params = None
+        self._gsd = None
         self._pipeline = FilterPipeline()
         self._preview_timer = QTimer()
         self._preview_timer.setSingleShot(True)
@@ -143,21 +192,68 @@ class FilterPanelWidget(QWidget):
         viewer_splitter.addWidget(after_group)
         main_layout.addWidget(viewer_splitter, stretch=3)
 
-        # --- Filter pipeline controls ---
-        controls_group = QGroupBox("Pipeline Filtri")
+        # --- Guided choice (recommended path) ---
+        guide_group = QGroupBox("1. Scelta guidata dei filtri (consigliata)")
+        gl = QVBoxLayout(guide_group)
+        guide_txt = QLabel(
+            "I filtri servono solo se migliorano la misura: la procedura li "
+            "<b>prova con il DIC sulle tue immagini</b> e propone quello "
+            "migliore (spesso nessuno), con i parametri gia' impostati.")
+        guide_txt.setWordWrap(True)
+        guide_txt.setStyleSheet("font-size: 11px; color: #37474f;")
+        gl.addWidget(guide_txt)
+        grow = QHBoxLayout()
+        self.btn_wizard = QPushButton("🧭  Procedura guidata (con domande)")
+        self.btn_wizard.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; "
+            "padding: 8px; font-weight: bold; }")
+        self.btn_wizard.setToolTip(
+            "Alcune domande sulle foto (luce, rumore, contrasto), poi prova "
+            "dei filtri adatti e proposta con pulsante Applica.")
+        self.btn_wizard.clicked.connect(lambda: self._open_wizard(auto=False))
+        grow.addWidget(self.btn_wizard)
+        self.btn_auto = QPushButton("⚡  Scelta automatica")
+        self.btn_auto.setStyleSheet(
+            "QPushButton { background-color: #FF9800; color: white; "
+            "padding: 8px; font-weight: bold; }")
+        self.btn_auto.setToolTip(
+            "Nessuna domanda: il programma misura luce, rumore e contrasto, "
+            "prova i filtri e propone il migliore.")
+        self.btn_auto.clicked.connect(lambda: self._open_wizard(auto=True))
+        grow.addWidget(self.btn_auto)
+        gl.addLayout(grow)
+        self.applied_label = QLabel("Filtri applicati alle immagini: nessuno")
+        self.applied_label.setStyleSheet(
+            "font-size: 11px; padding: 3px; background-color: #e8eaf6;")
+        self.applied_label.setWordWrap(True)
+        gl.addWidget(self.applied_label)
+        self.auto_progress = self.applied_label      # legacy name
+        main_layout.addWidget(guide_group)
+
+        # --- Filter pipeline controls (manual) ---
+        controls_group = QGroupBox("2. Regolazione manuale (facoltativa)")
         controls_layout = QVBoxLayout(controls_group)
 
         # Add filter row
         add_row = QHBoxLayout()
         self.filter_combo = QComboBox()
-        for name, info in FILTER_REGISTRY.items():
-            self.filter_combo.addItem(f"{name} - {info['description']}", name)
+        for name in FILTER_REGISTRY:
+            label, when, ok = FILTER_INFO_IT.get(name, (name, "", True))
+            self.filter_combo.addItem(label if ok else f"⚠ {label}", name)
+            self.filter_combo.setItemData(self.filter_combo.count() - 1,
+                                          when, Qt.ToolTipRole)
+        self.filter_combo.currentIndexChanged.connect(self._on_combo_changed)
         add_row.addWidget(self.filter_combo, stretch=1)
 
         self.btn_add = QPushButton("Aggiungi Filtro")
         self.btn_add.clicked.connect(self._add_filter)
         add_row.addWidget(self.btn_add)
         controls_layout.addLayout(add_row)
+        self.when_label = QLabel()
+        self.when_label.setWordWrap(True)
+        self.when_label.setStyleSheet("font-size: 11px; color: #616161;")
+        controls_layout.addWidget(self.when_label)
+        self._on_combo_changed()
 
         # Filter list
         self.filter_list = QListWidget()
@@ -193,30 +289,8 @@ class FilterPanelWidget(QWidget):
 
         main_layout.addWidget(controls_group, stretch=2)
 
-        # Auto-optimize button
-        auto_group = QGroupBox("Ottimizzazione Automatica")
-        auto_layout = QVBoxLayout(auto_group)
-
-        self.btn_auto = QPushButton("🔍  Auto-Ottimizza Filtri")
-        self.btn_auto.setStyleSheet(
-            "QPushButton { background-color: #FF9800; color: white; "
-            "padding: 8px; font-weight: bold; font-size: 13px; }")
-        self.btn_auto.setToolTip(
-            "Testa automaticamente diverse combinazioni di filtri "
-            "e seleziona quella che produce la migliore qualità "
-            "per l'analisi DIC (texture, contrasto, nitidezza).")
-        self.btn_auto.clicked.connect(self._run_auto_optimize)
-        auto_layout.addWidget(self.btn_auto)
-
-        self.auto_progress = QLabel("")
-        self.auto_progress.setStyleSheet("font-size: 11px; color: #616161;")
-        self.auto_progress.setWordWrap(True)
-        auto_layout.addWidget(self.auto_progress)
-
-        main_layout.addWidget(auto_group)
-
-        # Apply button
-        self.btn_apply = QPushButton("Applica Pipeline a Tutte le Immagini")
+        # Apply button (manual pipeline)
+        self.btn_apply = QPushButton("Applica questi filtri a tutte le immagini")
         self.btn_apply.setStyleSheet(
             "QPushButton { background-color: #2196F3; color: white; "
             "padding: 8px; font-weight: bold; }")
@@ -241,6 +315,20 @@ class FilterPanelWidget(QWidget):
         """
         self._all_images = list(images_gray) if images_gray else []
 
+    def set_analysis_context(self, deformed_gray=None, dic_params=None, gsd=None):
+        """Raw deformed image + DIC settings used by the guided choice."""
+        self._deformed_image = deformed_gray
+        self._dic_params = dic_params
+        self._gsd = gsd
+
+    def _on_combo_changed(self, *_):
+        name = self.filter_combo.currentData()
+        label, when, ok = FILTER_INFO_IT.get(name, (name, "", True))
+        self.when_label.setText(("" if ok else "⚠ ") + "Quando usarlo: " + when
+                                if when else "")
+        self.when_label.setStyleSheet(
+            "font-size: 11px; color: %s;" % ("#616161" if ok else "#c62828"))
+
     def _add_filter(self):
         """Add selected filter to pipeline."""
         filter_name = self.filter_combo.currentData()
@@ -257,7 +345,7 @@ class FilterPanelWidget(QWidget):
         param_widget.params_changed.connect(self._on_params_changed)
         self._filter_param_widgets.append(param_widget)
 
-        item = QListWidgetItem(f"{len(self._pipeline)}. {filter_name}")
+        item = QListWidgetItem(f"{len(self._pipeline)}. {filter_label(filter_name)}")
         self.filter_list.addItem(item)
         self.filter_list.setCurrentItem(item)
 
@@ -312,7 +400,7 @@ class FilterPanelWidget(QWidget):
         for i, step in enumerate(self._pipeline.steps):
             item = self.filter_list.item(i)
             if item:
-                item.setText(f"{i + 1}. {step['filter_name']}")
+                item.setText(f"{i + 1}. {filter_label(step['filter_name'])}")
 
     def _on_filter_selected(self, row):
         """Show parameters for the selected filter."""
@@ -352,17 +440,32 @@ class FilterPanelWidget(QWidget):
             print(f"Filter preview error: {e}")
 
     def _apply_pipeline(self):
-        """Emit signal to apply pipeline to all images."""
-        self.filter_applied.emit(self._pipeline)
+        """Emit signal to apply pipeline to all images.
+
+        A copy is emitted: later edits in the panel must not silently
+        change the pipeline stored in the project (whose images were
+        filtered with the applied version).
+        """
+        applied = copy_pipeline(self._pipeline)
+        self._show_applied(applied)
+        self.filter_applied.emit(applied)
+
+    def _show_applied(self, pipeline):
+        names = [filter_label(s['filter_name']) for s in pipeline.steps]
+        self.applied_label.setText(
+            "Filtri applicati alle immagini: "
+            + (" → ".join(names) if names else "nessuno (immagini originali)"))
 
     def get_pipeline(self):
         """Return current filter pipeline."""
         return self._pipeline
 
     def set_pipeline(self, pipeline):
-        """Restore a saved pipeline."""
+        """Restore a saved pipeline (the panel works on its own copy)."""
+        pipeline = copy_pipeline(pipeline)
         self._clear_all()
         self._pipeline = pipeline
+        self._show_applied(pipeline)
         for step in pipeline.steps:
             filter_name = step['filter_name']
             params = step['params']
@@ -375,90 +478,28 @@ class FilterPanelWidget(QWidget):
             param_widget.params_changed.connect(self._on_params_changed)
             self._filter_param_widgets.append(param_widget)
 
-            item = QListWidgetItem(f"{self.filter_list.count() + 1}. {filter_name}")
+            item = QListWidgetItem(
+                f"{self.filter_list.count() + 1}. {filter_label(filter_name)}")
             self.filter_list.addItem(item)
 
         self._schedule_preview()
 
     # ------------------------------------------------------------------
-    # Auto-optimization
+    # Guided choice (questions + DIC tests + Apply button)
     # ------------------------------------------------------------------
 
-    def _run_auto_optimize(self):
-        """Run automatic filter optimization on all loaded images."""
-        from PyQt5.QtWidgets import QApplication, QMessageBox
+    def _open_wizard(self, auto=False):
+        """Open the guided choice; on Apply, set and apply the pipeline."""
+        from PyQt5.QtWidgets import QMessageBox, QDialog
+        from dic_app.gui.filter_wizard import FilterWizardDialog
 
         if self._reference_image is None:
-            QMessageBox.warning(self, "Errore",
-                                "Caricare prima un'immagine di riferimento.")
+            QMessageBox.warning(self, "Filtri",
+                                "Caricare prima le immagini nella scheda Progetto.")
             return
-
-        # Use all images if available, otherwise just the reference
-        if self._all_images and len(self._all_images) > 0:
-            images_to_test = self._all_images
-        else:
-            images_to_test = [self._reference_image]
-
-        n_imgs = len(images_to_test)
-        self.btn_auto.setEnabled(False)
-        self.auto_progress.setText(
-            f"Analisi in corso su {n_imgs} immagini...")
-        QApplication.processEvents()
-
-        optimizer = AutoFilterOptimizer(subset_size=31)
-
-        def on_progress(pct, msg):
-            self.auto_progress.setText(f"[{pct}%] {msg}")
-            QApplication.processEvents()
-
-        optimizer.set_progress_callback(on_progress)
-
-        try:
-            result = optimizer.optimize(
-                self._reference_image,
-                images=images_to_test)
-
-            # Build result summary
-            summary = f"Migliore: {result.best_name}\n"
-            summary += f"Punteggio medio: {result.best_score:.4f} "
-            summary += f"({result.improvement_percent:+.1f}% vs originale)\n"
-            summary += f"Valutato su: {n_imgs} immagini\n"
-            summary += f"Tempo: {result.computation_time_s:.1f}s\n\n"
-            summary += "Classifica:\n"
-            for i, r in enumerate(result.all_results[:5]):
-                marker = " ** " if i == 0 else "    "
-                summary += f"{marker}{i + 1}. {r['name']} ({r['score']:.4f})\n"
-
-            # Metrics comparison (reference image)
-            bm = result.baseline_metrics
-            am = result.best_metrics
-            summary += f"\nMetriche rif. (originale -> ottimizzata):\n"
-            summary += f"  Gradiente:  {bm.mean_gradient:.1f} -> {am.mean_gradient:.1f}\n"
-            summary += f"  Contrasto:  {bm.local_contrast:.1f} -> {am.local_contrast:.1f}\n"
-            summary += f"  Entropia:   {bm.entropy:.2f} -> {am.entropy:.2f}\n"
-            summary += f"  Nitidezza:  {bm.laplacian_var:.0f} -> {am.laplacian_var:.0f}\n"
-            summary += f"  SNR:        {bm.snr_estimate:.1f} -> {am.snr_estimate:.1f}\n"
-            summary += f"  NCC score:  {bm.ncc_self_score:.4f} -> {am.ncc_self_score:.4f}\n"
-
-            self.auto_progress.setText(summary)
-
-            # Ask user if they want to apply
-            reply = QMessageBox.question(
-                self, "Ottimizzazione Completata",
-                f"Pipeline migliore: {result.best_name}\n"
-                f"Miglioramento: {result.improvement_percent:+.1f}%\n"
-                f"(valutata su {n_imgs} immagini)\n\n"
-                f"Applicare questa pipeline?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes)
-
-            if reply == QMessageBox.Yes:
-                self.set_pipeline(result.best_pipeline)
-                self._schedule_preview()
-
-        except Exception as e:
-            self.auto_progress.setText(f"Errore: {e}")
-            QMessageBox.critical(self, "Errore", f"Ottimizzazione fallita:\n{e}")
-
-        finally:
-            self.btn_auto.setEnabled(True)
+        dlg = FilterWizardDialog(self._reference_image, self._deformed_image,
+                                 self._dic_params, self._gsd,
+                                 auto_start=auto, parent=self)
+        if dlg.exec() == QDialog.Accepted and dlg.chosen_pipeline is not None:
+            self.set_pipeline(dlg.chosen_pipeline)
+            self._apply_pipeline()

@@ -1,4 +1,4 @@
-"""Main application window with 8-tab workflow."""
+"""Main application window with 9-tab workflow."""
 
 import os
 import numpy as np
@@ -19,8 +19,10 @@ from dic_app.gui.roi_editor import ROIEditorWidget
 from dic_app.gui.params_panel import ParamsPanelWidget
 from dic_app.gui.results_viewer import ResultsViewerWidget
 from dic_app.gui.report_dialog import ReportDialog
+from dic_app.gui.time_series_panel import TimeSeriesPanel
 
-from dic_app.core.dic_engine import DICEngine, DICParameters, DICResult
+from dic_app.core.dic_engine import (
+    DICEngine, DICParameters, DICResult, DICCancelledError)
 from dic_app.core.mask_manager import MaskManager
 from dic_app.io.image_loader import ImageLoader, ImageData
 from dic_app.io.project_manager import ProjectState, ProjectManager
@@ -34,21 +36,28 @@ class DICWorker(QObject):
     """Worker for running DIC analysis in a background thread."""
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object)
+    cancelled = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, engine, ref_image, def_image, mask=None):
+    def __init__(self, engine, ref_image, def_image, mask=None,
+                 surface=None, gsd=None):
         super().__init__()
         self.engine = engine
         self.ref_image = ref_image
         self.def_image = def_image
         self.mask = mask
+        self.surface = surface
+        self.gsd = gsd
 
     def run(self):
         try:
             self.engine.set_progress_callback(
                 lambda p, m: self.progress.emit(p, m))
-            result = self.engine.run(self.ref_image, self.def_image, self.mask)
+            result = self.engine.run(self.ref_image, self.def_image, self.mask,
+                                     surface=self.surface, gsd=self.gsd)
             self.finished.emit(result)
+        except DICCancelledError:
+            self.cancelled.emit()
         except Exception as e:
             self.error.emit(str(e))
 
@@ -138,9 +147,14 @@ class DICMainWindow(QMainWindow):
         self.results_viewer = ResultsViewerWidget()
         self.tabs.addTab(self.results_viewer, "7. Risultati")
 
-        # --- Tab 7: Report ---
+        # --- Tab 7: Time series (more than two surveys) ---
+        self.time_series_panel = TimeSeriesPanel()
+        self.time_series_panel.open_in_results.connect(self._open_series_result)
+        self.tabs.addTab(self.time_series_panel, "8. Serie temporale")
+
+        # --- Tab 8: Report ---
         self.tab_report = self._create_report_tab()
-        self.tabs.addTab(self.tab_report, "8. Report")
+        self.tabs.addTab(self.tab_report, "9. Report")
 
         main_layout.addWidget(self.tabs)
 
@@ -169,6 +183,15 @@ class DICMainWindow(QMainWindow):
         self.btn_remove_image.clicked.connect(self._remove_image)
         btn_row.addWidget(self.btn_remove_image)
         img_layout.addLayout(btn_row)
+
+        self.btn_precrop = QPushButton("Ritaglio preliminare (foto grandi)...")
+        self.btn_precrop.setToolTip(
+            "Allinea grossolanamente le foto a un'immagine guida e le ritaglia "
+            "tutte sullo stesso rettangolo, salvando i ritagli su disco.")
+        self.btn_precrop.setStyleSheet(
+            "QPushButton { background-color: #FF9800; color: white; padding: 6px; }")
+        self.btn_precrop.clicked.connect(self._open_precrop_dialog)
+        img_layout.addWidget(self.btn_precrop)
 
         self.image_list = QListWidget()
         self.image_list.currentRowChanged.connect(self._on_image_selected)
@@ -408,6 +431,7 @@ class DICMainWindow(QMainWindow):
     def _connect_signals(self):
         """Connect inter-panel signals."""
         self.filter_panel.filter_applied.connect(self._on_filter_applied)
+        self.results_viewer.gsd_changed.connect(self._on_results_gsd_changed)
         self.alignment_panel.alignment_applied.connect(self._on_alignment_applied)
         self.alignment_panel.alignment_reset.connect(self._on_alignment_reset)
         self.roi_editor.mask_updated.connect(self._on_mask_updated)
@@ -430,8 +454,8 @@ class DICMainWindow(QMainWindow):
         for fp in filepaths:
             try:
                 img_data = ImageLoader.load(fp)
-                self.project.images_data.append(img_data)
-                self.project.image_paths.append(fp)
+                # filtered at once with the applied pipeline, if any
+                self.project.add_image(img_data, fp)
 
                 # Add to list widget
                 name = img_data.filename
@@ -449,8 +473,102 @@ class DICMainWindow(QMainWindow):
 
         if self.project.images_data:
             self.image_list.setCurrentRow(0)
+            self._apply_gsd_from_images()
             self._update_status(f"{len(self.project.images_data)} immagini caricate")
             logger.info(f"Loaded {len(self.project.images_data)} images")
+
+    def _open_precrop_dialog(self):
+        """Coarse-align large photos to a guide and crop them to a rectangle."""
+        if len(self.project.images_data) < 2:
+            QMessageBox.warning(self, "Ritaglio preliminare",
+                                "Carica almeno 2 immagini (la guida e una da ritagliare).")
+            return
+        from dic_app.gui.precrop_dialog import PrecropDialog
+        dialog = PrecropDialog(self.project.images_data,
+                               self.project.reference_index, self)
+        if dialog.exec_() != PrecropDialog.Accepted or not dialog.output_paths:
+            return
+        if not dialog.replace_in_project:
+            self._update_status(
+                f"Ritagli salvati in {os.path.dirname(dialog.output_paths[0])}")
+            return
+
+        has_work = (self.project.alignment_result is not None
+                    or self.project.mask_manager is not None
+                    or bool(self.project.results))
+        if has_work:
+            reply = QMessageBox.question(
+                self, "Sostituire le immagini?",
+                "Il progetto ha gia' allineamento, maschere o risultati calcolati "
+                "sulle immagini originali: verranno azzerati perche' la geometria "
+                "cambia.\n\nUsare i ritagli nel progetto?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply != QMessageBox.Yes:
+                self._update_status("Ritagli salvati, progetto invariato")
+                return
+        self._replace_project_images(dialog.output_paths)
+
+    def _replace_project_images(self, paths):
+        """Load *paths* as the project images (first = reference).
+
+        Everything computed on the previous geometry is discarded.
+        """
+        new_data = []
+        for p in paths:
+            try:
+                new_data.append(ImageLoader.load(p))
+            except Exception as e:
+                QMessageBox.warning(self, "Errore", f"Impossibile caricare {p}:\n{e}")
+        if len(new_data) < 2:
+            QMessageBox.warning(self, "Errore",
+                                "Servono almeno 2 ritagli validi: progetto invariato.")
+            return
+
+        pr = self.project
+        pr.images_data = new_data
+        pr.image_paths = [d.filepath for d in new_data]
+        pr.reference_index = 0
+        pr.alignment_result = None
+        pr.alignment_params = None
+        pr.aligned_ref = None
+        pr.aligned_def = None
+        pr.aligned_def_index = None
+        pr.clear_extra_alignments()
+        pr.mask_manager = None
+        pr.results = []
+        pr.results_pair = None
+        pr.time_series = None
+        pr.strain_data = None
+        pr.active_zones = None
+        pr.preprocessed_images = []
+        if pr.filter_pipeline is not None:
+            # Keep the chosen filters, re-applied to the new images
+            pr.preprocessed_images = [pr.filter_pipeline.apply(d.image_gray)
+                                      for d in new_data]
+
+        # Old ROIs refer to the uncropped geometry: start the editor empty
+        self.roi_editor.set_mask_manager(
+            MaskManager(new_data[0].image_gray.shape[:2]))
+
+        self.image_list.clear()
+        self.ref_combo.blockSignals(True)
+        self.ref_combo.clear()
+        self.deformed_combo.clear()
+        for img in new_data:
+            name = img.filename
+            if img.has_gps:
+                name += f"  ({img.gps.latitude:.5f}, {img.gps.longitude:.5f})"
+            self.image_list.addItem(name)
+            self.ref_combo.addItem(img.filename)
+            self.deformed_combo.addItem(img.filename)
+        self.ref_combo.setCurrentIndex(0)
+        self.ref_combo.blockSignals(False)
+        self.image_list.setCurrentRow(0)
+        self._apply_gsd_from_images(force=True)
+        self._update_status(
+            f"Progetto aggiornato con {len(new_data)} ritagli "
+            f"({new_data[0].width}x{new_data[0].height} px), riferimento = guida")
+        logger.info(f"Project images replaced by {len(new_data)} preliminary crops")
 
     def _remove_image(self):
         """Remove selected image."""
@@ -458,10 +576,21 @@ class DICMainWindow(QMainWindow):
         if row < 0:
             return
         self.image_list.takeItem(row)
-        self.project.images_data.pop(row)
-        self.project.image_paths.pop(row)
+        # Images, filtered images, reference/alignment/result indices are
+        # remapped together (the filtered list used to keep the removed
+        # image, so DIC analysed the wrong photos).
+        notes = self.project.remove_image(row)
+        self.ref_combo.blockSignals(True)
         self.ref_combo.removeItem(row)
-        self.deformed_combo.removeItem(row)
+        if 0 <= self.project.reference_index < self.ref_combo.count():
+            self.ref_combo.setCurrentIndex(self.project.reference_index)
+        self.ref_combo.blockSignals(False)
+        self.deformed_combo.clear()
+        for i, img in enumerate(self.project.images_data):
+            if i != self.project.reference_index:
+                self.deformed_combo.addItem(img.filename, i)
+        if notes:
+            QMessageBox.information(self, "Immagine rimossa", "\n".join(notes))
 
     def _on_image_selected(self, row):
         """Preview selected image and show info."""
@@ -497,6 +626,8 @@ class DICMainWindow(QMainWindow):
     def _on_reference_changed(self, index):
         """Update reference image index."""
         if 0 <= index < len(self.project.images_data):
+            if index != self.project.reference_index:
+                self.project.time_series = None
             self.project.reference_index = index
 
     def _calculate_gsd(self):
@@ -509,13 +640,40 @@ class DICMainWindow(QMainWindow):
             sensor_w = self.sensor_spin.value()
 
             gsd = ImageLoader.compute_gsd(
-                altitude, fl, sensor_w, img.width)
+                altitude, fl, sensor_w, img.original_width)
             self.gsd_spin.setValue(gsd)
             self.project.gsd = gsd
             self._update_status(f"GSD calcolato: {gsd:.4f} m/px ({gsd * 100:.2f} cm/px)")
 
     def _on_gsd_changed(self, value):
         self.project.gsd = value
+        # keep the results panel (mm, m2, detachments) in sync
+        if hasattr(self, 'results_viewer'):
+            self.results_viewer.set_gsd(value)
+
+    def _on_results_gsd_changed(self, value):
+        """GSD edited in the results panel: same value for the project."""
+        self.project.gsd = value if value > 0 else None
+        if value > 0:
+            self.gsd_spin.blockSignals(True)
+            self.gsd_spin.setValue(value)
+            self.gsd_spin.blockSignals(False)
+
+    def _apply_gsd_from_images(self, force=False):
+        """Use the pixel size stored in a GeoTIFF (or its crop) as GSD.
+
+        All DIC images share the reference geometry, so the reference's
+        pixel size is the GSD of the analysis.
+        """
+        imgs = self.project.images_data
+        if not imgs or (self.project.gsd and not force):
+            return
+        ref = imgs[min(self.project.reference_index, len(imgs) - 1)]
+        if ref.gsd and ref.gsd > 0:
+            self.gsd_spin.setValue(ref.gsd)      # also sets project.gsd
+            self.project.gsd = ref.gsd
+            self._update_status(
+                f"GSD letto dal GeoTIFF: {ref.gsd * 100:.2f} cm/px")
 
     # ------------------------------------------------------------------
     # Filter pipeline
@@ -563,6 +721,8 @@ class DICMainWindow(QMainWindow):
         from dic_app.core.image_registration import ImageRegistration
         self.project.alignment_result = result
         self.project.alignment_params = self.alignment_panel.get_parameters()
+        self.project.clear_extra_alignments()
+        self.project.time_series = None      # computed on the old geometry
 
         aligned = self.alignment_panel.get_aligned_images()
         if aligned:
@@ -588,6 +748,8 @@ class DICMainWindow(QMainWindow):
         self.project.aligned_ref = None
         self.project.aligned_def = None
         self.project.aligned_def_index = None
+        self.project.clear_extra_alignments()
+        self.project.time_series = None
         self._update_status("Allineamento resettato")
 
     def _reapply_alignment(self):
@@ -606,9 +768,13 @@ class DICMainWindow(QMainWindow):
             return
 
         ref_img = self.project.get_pre_alignment_ref()
-        def_img = self.project.get_pre_alignment_def()
+        def_img = self.project.get_pre_alignment_def(
+            self.project.aligned_def_index)
         if ref_img is None or def_img is None:
             return
+
+        # Per-image transforms were computed on the old preprocessing
+        self.project.clear_extra_alignments()
 
         reg = ImageRegistration(params)
         ref_crop, def_crop = reg.apply_to_pair(ref_img, def_img, result)
@@ -641,16 +807,31 @@ class DICMainWindow(QMainWindow):
     def _on_tab_changed(self, index):
         """Update tab contents when switching."""
         if index == 1:  # Preprocessing
-            ref_raw = self.project.get_pre_alignment_ref()
-            if ref_raw is None and self.project.images_data:
-                ref_raw = self.project.images_data[
-                    self.project.reference_index].image_gray
+            # Always the ORIGINAL images: the pipeline is applied to the
+            # raw photos (get_pre_alignment_ref would return the already
+            # filtered image, so the preview would filter it twice).
+            pr = self.project
+            ref_raw = def_raw = None
+            if pr.images_data and pr.reference_index < len(pr.images_data):
+                ref_raw = pr.images_data[pr.reference_index].image_gray
+                def_idx = self.deformed_combo.currentData()
+                if def_idx is None or def_idx == pr.reference_index \
+                        or def_idx >= len(pr.images_data):
+                    def_idx = next((i for i in range(len(pr.images_data))
+                                    if i != pr.reference_index), None)
+                if def_idx is not None:
+                    def_raw = pr.images_data[def_idx].image_gray
             if ref_raw is not None:
                 self.filter_panel.set_reference_image(ref_raw)
+            try:
+                dic_params = self.params_panel.get_parameters()
+            except Exception:
+                dic_params = pr.dic_params
+            self.filter_panel.set_analysis_context(def_raw, dic_params, pr.gsd)
 
             # Pass ALL grayscale images for multi-image auto-optimization
-            if self.project.images_data:
-                all_grays = [img.image_gray for img in self.project.images_data
+            if pr.images_data:
+                all_grays = [img.image_gray for img in pr.images_data
                              if img.image_gray is not None]
                 self.filter_panel.set_all_images(all_grays)
 
@@ -663,7 +844,14 @@ class DICMainWindow(QMainWindow):
         elif index == 3:  # Masks
             ref = self.project.get_reference_image()
             if ref is not None:
-                self.roi_editor.set_image(ref)
+                # Bring existing ROIs onto the image shown (they may have
+                # been drawn before/after an alignment that cropped it)
+                if self.project.mask_manager:
+                    m = self.project.mask_manager_in_reference_frame(ref.shape)
+                    if m is not None:
+                        self.project.mask_manager = m
+                self.roi_editor.set_image(
+                    ref, frame_offset=self.project.reference_frame_offset())
                 if self.project.mask_manager:
                     self.roi_editor.set_mask_manager(self.project.mask_manager)
 
@@ -675,12 +863,23 @@ class DICMainWindow(QMainWindow):
                 def_idx = self.deformed_combo.currentData()
                 def_img = self.project.get_deformed_image(def_idx)
                 self.params_panel.set_images_for_guess(ref, def_img)
+                try:
+                    self.params_panel.set_context(
+                        self.project.gsd, self.project.get_reference_rgb(),
+                        self.project.get_deformed_rgb(def_idx))
+                except Exception as e:
+                    logger.warning(f"Colour context for parameters failed: {e}")
+                    self.params_panel.set_context(self.project.gsd)
             elif self.project.images_data:
                 shape = self.project.images_data[0].image_gray.shape
                 self.params_panel.update_estimation(shape)
 
         elif index == 5:  # Analysis
             self._update_analysis_summary()
+
+        elif self.tabs.widget(index) is self.time_series_panel:
+            self.time_series_panel.set_context(
+                self.project, self._series_params, self._series_mask)
 
     # ------------------------------------------------------------------
     # DIC Analysis
@@ -696,8 +895,16 @@ class DICMainWindow(QMainWindow):
             ref = self.project.images_data[self.project.reference_index]
             summary += f"Riferimento: {ref.filename} ({ref.width}x{ref.height})\n"
 
-        n_pre = len(self.project.preprocessed_images)
-        summary += f"Immagini preprocessate: {n_pre}\n"
+        fp = self.project.filter_pipeline
+        if fp is not None and len(fp) > 0 and self.project.preprocessed_images:
+            from dic_app.gui.filter_panel import filter_label
+            names = " -> ".join(filter_label(s['filter_name']) for s in fp.steps)
+            summary += f"Filtri usati dal DIC: {names}\n"
+        else:
+            summary += "Filtri usati dal DIC: nessuno (immagini originali)\n"
+        if self.filter_panel.get_pipeline().to_dict() != (fp.to_dict() if fp else []):
+            summary += ("  ATTENZIONE: nella scheda Filtri ci sono modifiche non "
+                        "applicate (premere 'Applica').\n")
 
         if self.project.mask_manager:
             summary += f"ROI definite: {len(self.project.mask_manager)}\n"
@@ -742,15 +949,22 @@ class DICMainWindow(QMainWindow):
             QMessageBox.warning(self, "Errore", "Nessuna immagine deformata selezionata")
             return
 
+        # Remember the pair now: the combo may change while the analysis runs
+        self._pending_results_pair = (self.project.reference_index, def_idx)
         def_image = self.project.get_deformed_image(def_idx)
 
         if ref_image is None or def_image is None:
-            QMessageBox.warning(self, "Errore", "Impossibile caricare le immagini")
+            msg = "Impossibile caricare le immagini"
+            if self.project.alignment_result is not None:
+                msg += (".\nCon l'allineamento attivo, la deformata selezionata "
+                        "deve essere registrata sul riferimento: la registrazione "
+                        "automatica e' fallita (vedi log).")
+            QMessageBox.warning(self, "Errore", msg)
             return
 
-        # Ensure ref and def images have the same dimensions.
-        # After alignment+crop they should match, but mismatches can
-        # occur with different source resolutions or rounding in crop.
+        # Without alignment, images of different size cannot be compared
+        # pixel-by-pixel; cropping is only a last resort.  With alignment
+        # both images share the reference crop box, so shapes match.
         import cv2 as _cv2
         if ref_image.shape != def_image.shape:
             logger.warning(
@@ -764,10 +978,9 @@ class DICMainWindow(QMainWindow):
         # Get mask
         mask = None
         if self.project.mask_manager:
-            mask = self.project.mask_manager.generate_mask()
-            # Resize mask to match image if needed
-            if mask.shape != ref_image.shape:
-                mask = _cv2.resize(mask, (ref_image.shape[1], ref_image.shape[0]))
+            mask = self._reference_mask(ref_image.shape)
+            if mask is None:
+                return
 
         # Get parameters
         params = self.project.dic_params or self.params_panel.get_parameters()
@@ -815,15 +1028,40 @@ class DICMainWindow(QMainWindow):
         engine = DICEngine(params)
 
         self._worker_thread = QThread()
-        self._worker = DICWorker(engine, ref_image, def_image, mask)
+        # Automatic vegetation / water masks from the colour images
+        surface = None
+        from dic_app.core.dic_engine import DICMethod as _DM
+        if params.method == _DM.ICGN and (params.exclude_vegetation
+                                          or params.exclude_water):
+            try:
+                from dic_app.core.change_detection import surface_labels
+                h0, w0 = ref_image.shape[:2]
+                ref_rgb = self.project.get_reference_rgb()
+                def_rgb = self.project.get_deformed_rgb(def_idx)
+                ref_rgb = ref_rgb[:h0, :w0] if ref_rgb is not None else None
+                def_rgb = def_rgb[:h0, :w0] if def_rgb is not None else None
+                surface = surface_labels(
+                    ref_rgb, def_rgb, ref_image.shape,
+                    vegetation=params.exclude_vegetation,
+                    water=params.exclude_water,
+                    veg_sensitivity=params.veg_sensitivity,
+                    water_sensitivity=params.water_sensitivity)
+            except Exception as e:
+                logger.warning(f"Surface masks not computed: {e}")
+                surface = None
+
+        self._worker = DICWorker(engine, ref_image, def_image, mask,
+                                 surface=surface, gsd=self.project.gsd)
         self._worker.moveToThread(self._worker_thread)
 
         self._worker_thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_analysis_progress)
         self._worker.finished.connect(self._on_analysis_finished)
         self._worker.error.connect(self._on_analysis_error)
+        self._worker.cancelled.connect(self._on_analysis_cancelled)
         self._worker.finished.connect(self._worker_thread.quit)
         self._worker.error.connect(self._worker_thread.quit)
+        self._worker.cancelled.connect(self._worker_thread.quit)
 
         # UI state
         self.btn_run.setEnabled(False)
@@ -834,6 +1072,147 @@ class DICMainWindow(QMainWindow):
         self.analysis_log.append("Avvio analisi DIC...\n")
 
         self._worker_thread.start()
+
+    # ------------------------------------------------------------------
+    # Time series
+    # ------------------------------------------------------------------
+
+    def _series_params(self):
+        params = self.params_panel.get_parameters()
+        self.project.dic_params = params
+        return params
+
+    def _series_mask(self):
+        """(ok, mask) for the time series, in the reference geometry."""
+        if not self.project.mask_manager:
+            return True, None
+        ref = self.project.get_reference_image()
+        if ref is None:
+            return False, None
+        mask = self._reference_mask(ref.shape)
+        return mask is not None, mask
+
+    def _reference_mask(self, ref_shape):
+        """Mask of the ROIs in the geometry of the analysed reference."""
+        m = self.project.mask_manager_in_reference_frame(tuple(ref_shape[:2]))
+        if m is not None:
+            return np.ascontiguousarray(m.generate_mask())
+        # Old project whose ROI frame is unknown: legacy crop logic
+        return self._fit_mask_to_reference(
+            self.project.mask_manager.generate_mask(), ref_shape)
+
+    def _image_pair_for(self, ref_idx, def_idx):
+        pr = self.project
+
+        def gray(i):
+            return pr.get_reference_image() if i == pr.reference_index \
+                else pr.get_deformed_image(i)
+
+        def rgb(i):
+            return pr.get_reference_rgb() if i == pr.reference_index \
+                else pr.get_deformed_rgb(i)
+        return gray(ref_idx), gray(def_idx), rgb(ref_idx), rgb(def_idx)
+
+    def _results_pair(self):
+        """(ref, def) indices of the images behind project.results."""
+        pr = self.project
+        if pr.results_pair is not None:
+            return pr.results_pair
+        # Legacy projects: reference + first deformed image
+        def_idx = next((i for i in range(len(pr.images_data))
+                        if i != pr.reference_index), None)
+        return pr.reference_index, def_idx
+
+    def _results_images(self):
+        """(gray ref, gray def, rgb ref, rgb def) of the analysed pair,
+        cropped to the result geometry."""
+        ref_idx, def_idx = self._results_pair()
+        if def_idx is None:
+            return None, None, None, None
+        return self._crop_to_result(self._image_pair_for(ref_idx, def_idx))
+
+    def _crop_to_result(self, images):
+        result = self.project.results[0]
+        g_ref = images[0]
+        if result.ref_shape and result.ref_shape[0]:
+            h, w = result.ref_shape[:2]
+        elif g_ref is not None:
+            h, w = g_ref.shape[:2]
+        else:
+            return images
+        return tuple(a[:h, :w] if a is not None else None for a in images)
+
+    def _show_results_with_images(self, images=None):
+        """Show project.results[0] over the images it was computed on."""
+        if not self.project.results:
+            return
+        if images is None:
+            images = self._results_images()
+        else:
+            images = self._crop_to_result(images)
+        g_ref, g_def, rgb_ref, rgb_def = images
+        base = rgb_ref if rgb_ref is not None else g_ref
+        self.results_viewer.set_result(self.project.results[0], base,
+                                       self.project.gsd)
+        if g_ref is not None and g_def is not None:
+            self.results_viewer.set_dic_images(g_ref, g_def, rgb_ref, rgb_def)
+
+    def _open_series_result(self, result, ref_idx, def_idx):
+        """Show one analysis of the series in the Results tab."""
+        try:
+            g_ref, g_def, rgb_ref, rgb_def = self._image_pair_for(ref_idx, def_idx)
+        except Exception as e:
+            QMessageBox.warning(self, "Serie temporale", f"Immagini non disponibili: {e}")
+            return
+        self.project.results = [result]
+        self.project.results_pair = (ref_idx, def_idx)
+        self._show_results_with_images((g_ref, g_def, rgb_ref, rgb_def))
+        self.tabs.setCurrentWidget(self.results_viewer)
+        names = self.project.images_data
+        self._update_status(f"Risultati: {names[ref_idx].filename} -> "
+                            f"{names[def_idx].filename}")
+
+    def _fit_mask_to_reference(self, mask, ref_shape):
+        """Bring a mask into the geometry of the analysed reference image.
+
+        Masks must be cropped (never resized/stretched), otherwise ROIs end
+        up in the wrong place.  Returns None (after warning the user) when
+        the mask cannot be mapped unambiguously.
+        """
+        ref_shape = tuple(ref_shape[:2])
+        if mask.shape == ref_shape:
+            return mask
+
+        # ROIs drawn on the full reference before alignment: the aligned
+        # reference is a pure crop of it, so apply the same crop box.
+        pre_ref = self.project.get_pre_alignment_ref()
+        if (self.project.alignment_result is not None and pre_ref is not None
+                and mask.shape == pre_ref.shape[:2]):
+            from dic_app.core.image_registration import ImageRegistration
+            x0, y0, x1, y1 = ImageRegistration.reference_crop_bbox(
+                self.project.alignment_result, pre_ref.shape)
+            mask = mask[y0:y1, x0:x1]
+            logger.info("Mask drawn before alignment: cropped to the "
+                        f"aligned area ({x0},{y0})-({x1},{y1})")
+
+        # Reference trimmed to the common ref/def size (top-left crop)
+        if (mask.shape != ref_shape and mask.shape[0] >= ref_shape[0]
+                and mask.shape[1] >= ref_shape[1]
+                and self.project.alignment_result is None):
+            mask = mask[:ref_shape[0], :ref_shape[1]]
+
+        if mask.shape != ref_shape:
+            logger.error(f"Mask shape {mask.shape} incompatible with "
+                         f"reference {ref_shape}")
+            QMessageBox.warning(
+                self, "Maschera non compatibile",
+                f"La maschera ({mask.shape[1]}x{mask.shape[0]} px) non "
+                f"corrisponde all'immagine di riferimento "
+                f"({ref_shape[1]}x{ref_shape[0]} px), probabilmente perche' "
+                f"l'allineamento e' stato modificato dopo aver disegnato le ROI.\n\n"
+                f"Ridisegna le ROI nella scheda Maschere.")
+            return None
+        return np.ascontiguousarray(mask)
 
     def _stop_analysis(self):
         """Request cancellation."""
@@ -849,6 +1228,7 @@ class DICMainWindow(QMainWindow):
     def _on_analysis_finished(self, result: DICResult):
         """Handle analysis completion."""
         self.project.results = [result]
+        self.project.results_pair = getattr(self, '_pending_results_pair', None)
         logger.info(
             f"Analysis completed: {result.computation_time_s:.1f}s, "
             f"valid={int(np.sum(result.mask_valid))}/{result.mask_valid.size}")
@@ -862,26 +1242,31 @@ class DICMainWindow(QMainWindow):
         self.analysis_log.append(
             f"Punti validi: {int(np.sum(result.mask_valid))} / {result.mask_valid.size}")
 
-        # Load results into viewer
-        base_img = self.project.get_reference_rgb()
-        if base_img is None:
-            base_img = self.project.get_reference_image()
-        self.results_viewer.set_result(result, base_img, self.project.gsd)
-
-        # Pass ref/def images to results viewer for area inspection (gray + RGB)
-        ref_image = self.project.get_reference_image()
-        def_idx = self.deformed_combo.currentData()
-        def_image = self.project.get_deformed_image(def_idx)
-        ref_rgb = self.project.get_reference_rgb()
-        def_rgb = self.project.get_deformed_rgb(def_idx)
-        if ref_image is not None and def_image is not None:
-            self.results_viewer.set_dic_images(
-                ref_image, def_image, ref_rgb, def_rgb)
+        # Load results + the images they were computed on into the viewer
+        self.project.active_zones = None     # they belonged to the old result
+        self._show_results_with_images()
 
         # Auto-switch to results tab (index 6 with alignment tab)
-        self.tabs.setCurrentIndex(6)
+        self.tabs.setCurrentWidget(self.results_viewer)
         self._update_status("Analisi completata - visualizzazione risultati")
         # Clean up worker and thread to prevent memory leaks
+        if self._worker_thread is not None:
+            self._worker_thread.deleteLater()
+            self._worker_thread = None
+        if hasattr(self, '_worker') and self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
+
+    def _on_analysis_cancelled(self):
+        """Analysis stopped by the user: discard the partial result."""
+        logger.info("Analysis cancelled by user")
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Analisi annullata")
+        self.analysis_log.append(
+            "\nAnalisi annullata: risultato parziale scartato.")
+        self._update_status("Analisi annullata")
         if self._worker_thread is not None:
             self._worker_thread.deleteLater()
             self._worker_thread = None
@@ -934,14 +1319,9 @@ class DICMainWindow(QMainWindow):
         strain_data = self.results_viewer.get_strain_data()
         active_zones = self.results_viewer.get_active_zones()
 
-        base_img = self.project.get_reference_rgb()
-        if base_img is None:
-            base_img = self.project.get_reference_image()
-
-        # Retrieve deformed images for zone detail pages
-        def_idx = self.deformed_combo.currentData()
-        deformed_gray = self.project.get_deformed_image(def_idx)
-        deformed_rgb = self.project.get_deformed_rgb(def_idx)
+        # Images the result was computed on (not the current combo choice)
+        g_ref, deformed_gray, rgb_ref, deformed_rgb = self._results_images()
+        base_img = rgb_ref if rgb_ref is not None else g_ref
 
         generator = ReportGenerator(
             result=result,
@@ -953,7 +1333,9 @@ class DICMainWindow(QMainWindow):
             active_zones=active_zones,
             pipeline_info=pipeline_info,
             gsd=self.project.gsd,
-            gps_info=self.project.get_gps_info()
+            gps_info=self.project.get_gps_info(),
+            geo_frame=self.project.get_analysis_frame(),
+            change_zones=self.results_viewer.get_change_zones(),
         )
 
         # Run in main thread (matplotlib is NOT thread-safe)
@@ -1003,6 +1385,8 @@ class DICMainWindow(QMainWindow):
         self.image_info_text.clear()
         self.analysis_log.clear()
         self.setWindowTitle("DIC Landslide Monitor v1.0 - Nuovo Progetto")
+        self.time_series_panel.set_context(
+            self.project, self._series_params, self._series_mask)
 
     def _open_project(self):
         dirpath = QFileDialog.getExistingDirectory(
@@ -1035,6 +1419,11 @@ class DICMainWindow(QMainWindow):
         try:
             # Sync current params
             self.project.dic_params = self.params_panel.get_parameters()
+            # Active zones (status + drawn detachment perimeters) live in
+            # the results viewer: copy them into the project before saving
+            if self.project.results:
+                self.project.active_zones = (
+                    self.results_viewer.get_active_zones() or None)
             ProjectManager.save(self.project, filepath)
             self._update_status(f"Progetto salvato: {filepath}")
         except Exception as e:
@@ -1043,6 +1432,9 @@ class DICMainWindow(QMainWindow):
     def _restore_project_ui(self):
         """Restore UI state from loaded project."""
         self.image_list.clear()
+        # Filling the combo emits currentIndexChanged(0), which would reset
+        # the saved reference index to 0: keep signals off until it is set.
+        self.ref_combo.blockSignals(True)
         self.ref_combo.clear()
         self.deformed_combo.clear()
 
@@ -1056,6 +1448,7 @@ class DICMainWindow(QMainWindow):
 
         if self.project.reference_index < self.ref_combo.count():
             self.ref_combo.setCurrentIndex(self.project.reference_index)
+        self.ref_combo.blockSignals(False)
 
         if self.project.gsd:
             self.gsd_spin.setValue(self.project.gsd)
@@ -1070,17 +1463,14 @@ class DICMainWindow(QMainWindow):
             self.params_panel.set_parameters(self.project.dic_params)
 
         if self.project.results:
-            base_img = self.project.get_reference_rgb()
-            self.results_viewer.set_result(
-                self.project.results[0], base_img, self.project.gsd)
-            # Pass ref/def images for area inspection tool (gray + RGB)
-            ref_image = self.project.get_reference_image()
-            def_image = self.project.get_deformed_image()
-            ref_rgb = self.project.get_reference_rgb()
-            def_rgb = self.project.get_deformed_rgb()
-            if ref_image is not None and def_image is not None:
-                self.results_viewer.set_dic_images(
-                    ref_image, def_image, ref_rgb, def_rgb)
+            # Results + the images they were computed on (not simply the
+            # first deformed image of the project)
+            self._show_results_with_images()
+            # saved active zones, with their detachment perimeters
+            self.results_viewer.set_active_zones(self.project.active_zones)
+
+        self.time_series_panel.set_context(
+            self.project, self._series_params, self._series_mask)
 
     # ------------------------------------------------------------------
     # Helpers

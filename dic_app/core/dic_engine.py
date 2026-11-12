@@ -19,7 +19,16 @@ from dic_app.utils.helpers import compute_magnitude, setup_logger
 logger = setup_logger(__name__)
 
 
+class DICCancelledError(Exception):
+    """Raised by DICEngine.run() when the analysis was cancelled.
+
+    A cancelled run leaves part of the grid unprocessed, so its partial
+    output must never be presented as a completed result.
+    """
+
+
 class DICMethod(Enum):
+    ICGN = "subset_icgn"
     TEMPLATE_NCC = "template_ncc"
     OPTICAL_FLOW_FARNEBACK = "optical_flow"
     PHASE_CORRELATION = "phase_correlation"
@@ -36,9 +45,9 @@ class SubPixelMethod(Enum):
 @dataclass
 class DICParameters:
     """Configuration parameters for DIC analysis."""
-    method: DICMethod = DICMethod.TEMPLATE_NCC
-    subset_size: int = 31
-    step_size: int = 5
+    method: DICMethod = DICMethod.ICGN
+    subset_size: int = 41
+    step_size: int = 10
     search_radius_x: int = 50
     search_radius_y: int = 50
     subpixel_method: SubPixelMethod = SubPixelMethod.GAUSSIAN
@@ -56,51 +65,52 @@ class DICParameters:
     max_features: int = 10000
     match_ratio: float = 0.75
     # Border margin to exclude noisy edges (pixels).
-    # Recommended ≥ subset_size to avoid edge artifacts from alignment.
+    # Recommended >= subset_size to avoid edge artifacts from alignment.
     border_margin: int = 10
+    # --- Subset IC-GN method ---
+    # Largest displacement expected (px). 0 = use the search radius.
+    # Drives the coarse-to-fine pyramid, so no search radius is needed.
+    max_displacement_px: float = 0.0
+    icgn_max_iter: int = 30
+    # Detachments / noisy surfaces
+    dual_correlation: bool = True        # also correlate locally-normalised images
+    normalize_sigma: float = 0.0         # 0 = subset_size / 4
+    change_threshold: float = 0.4        # below this in both -> surface changed
+    texture_min_std: float = 4.0         # subset grey-level std for "enough texture"
+    min_change_points: int = 4
+    min_change_area_m2: float = 0.5
+    exclude_vegetation: bool = True
+    exclude_water: bool = True
+    veg_sensitivity: float = 1.0
+    water_sensitivity: float = 1.0
+    threads: int = 0                     # 0 = all cores
 
     def to_dict(self):
-        return {
-            'method': self.method.value,
-            'subset_size': self.subset_size,
-            'step_size': self.step_size,
-            'search_radius_x': self.search_radius_x,
-            'search_radius_y': self.search_radius_y,
-            'subpixel_method': self.subpixel_method.value,
-            'correlation_threshold': self.correlation_threshold,
-            'of_pyr_scale': self.of_pyr_scale,
-            'of_levels': self.of_levels,
-            'of_winsize': self.of_winsize,
-            'of_iterations': self.of_iterations,
-            'of_poly_n': self.of_poly_n,
-            'of_poly_sigma': self.of_poly_sigma,
-            'upsample_factor': self.upsample_factor,
-            'max_features': self.max_features,
-            'match_ratio': self.match_ratio,
-            'border_margin': self.border_margin,
-        }
+        from dataclasses import fields
+        d = {}
+        for f in fields(self):
+            val = getattr(self, f.name)
+            d[f.name] = val.value if isinstance(val, Enum) else val
+        return d
 
     @classmethod
     def from_dict(cls, d):
-        return cls(
-            method=DICMethod(d.get('method', 'template_ncc')),
-            subset_size=d.get('subset_size', 31),
-            step_size=d.get('step_size', 5),
-            search_radius_x=d.get('search_radius_x', 50),
-            search_radius_y=d.get('search_radius_y', 50),
-            subpixel_method=SubPixelMethod(d.get('subpixel_method', 'gaussian')),
-            correlation_threshold=d.get('correlation_threshold', 0.6),
-            of_pyr_scale=d.get('of_pyr_scale', 0.5),
-            of_levels=d.get('of_levels', 5),
-            of_winsize=d.get('of_winsize', 15),
-            of_iterations=d.get('of_iterations', 3),
-            of_poly_n=d.get('of_poly_n', 5),
-            of_poly_sigma=d.get('of_poly_sigma', 1.2),
-            upsample_factor=d.get('upsample_factor', 20),
-            max_features=d.get('max_features', 10000),
-            match_ratio=d.get('match_ratio', 0.75),
-            border_margin=d.get('border_margin', 0),
-        )
+        from dataclasses import fields
+        kwargs = {}
+        for f in fields(cls):
+            if f.name not in d:
+                continue
+            val = d[f.name]
+            if f.name == 'method':
+                val = DICMethod(val)
+            elif f.name == 'subpixel_method':
+                val = SubPixelMethod(val)
+            kwargs[f.name] = val
+        if 'method' not in d:
+            kwargs['method'] = DICMethod.TEMPLATE_NCC   # legacy projects
+        if 'border_margin' not in d:
+            kwargs['border_margin'] = 0
+        return cls(**kwargs)
 
 
 @dataclass
@@ -117,9 +127,16 @@ class DICResult:
     parameters: DICParameters = field(default_factory=DICParameters)
     computation_time_s: float = 0.0
     ref_shape: Tuple[int, int] = (0, 0)
+    # Extra per-point grids (IC-GN): 'point_class', 'zncc_raw', 'zncc_norm',
+    # 'ux', 'uy', 'vx', 'vy' ...  See dic_app.core.change_detection.
+    extra: dict = field(default_factory=dict, repr=False)
+    # Zones where the surface changed (possible detachments)
+    change_zones: list = field(default_factory=list, repr=False)
 
     def to_npz(self, filepath):
         """Save result arrays to a compressed numpy archive."""
+        import json
+        extra = {f"x_{k}": np.asarray(v) for k, v in self.extra.items()}
         np.savez_compressed(
             filepath,
             u=self.u, v=self.v, magnitude=self.magnitude,
@@ -127,12 +144,31 @@ class DICResult:
             grid_x=self.grid_x, grid_y=self.grid_y,
             mask_valid=self.mask_valid,
             ref_shape=np.array(self.ref_shape),
+            method_used=np.array(self.method_used.value),
+            change_zones=np.array(json.dumps(self.change_zones, default=float)),
+            **extra,
         )
 
     @classmethod
     def from_npz(cls, filepath, params=None):
         """Load result from npz archive."""
+        import json
         data = np.load(filepath)
+        extra = {k[2:]: data[k] for k in data.files if k.startswith('x_')}
+        zones = []
+        if 'change_zones' in data.files:
+            try:
+                zones = json.loads(str(data['change_zones']))
+                for z in zones:
+                    z['bbox'] = tuple(z['bbox'])
+            except Exception:
+                zones = []
+        method = DICMethod.TEMPLATE_NCC
+        if 'method_used' in data.files:
+            try:
+                method = DICMethod(str(data['method_used']))
+            except ValueError:
+                pass
         return cls(
             u=data['u'], v=data['v'], magnitude=data['magnitude'],
             correlation_quality=data['correlation_quality'],
@@ -140,6 +176,7 @@ class DICResult:
             mask_valid=data['mask_valid'],
             ref_shape=tuple(data['ref_shape']),
             parameters=params or DICParameters(),
+            method_used=method, extra=extra, change_zones=zones,
         )
 
 
@@ -245,8 +282,14 @@ class DICEngine:
             'ok': ok,
         }
 
+    def _is_cancelled(self):
+        with self._lock:
+            return self._cancelled
+
     def run(self, ref_image: np.ndarray, def_image: np.ndarray,
-            mask: Optional[np.ndarray] = None) -> DICResult:
+            mask: Optional[np.ndarray] = None,
+            surface: Optional[np.ndarray] = None,
+            gsd: Optional[float] = None) -> DICResult:
         """Run DIC analysis using the selected method.
 
         Parameters
@@ -275,6 +318,7 @@ class DICEngine:
             logger.warning("Deformed image has very low contrast (std=%.1f).", def_image.std())
 
         method_map = {
+            DICMethod.ICGN: lambda r, d, m: self._run_icgn(r, d, m, surface),
             DICMethod.TEMPLATE_NCC: self._run_template_ncc,
             DICMethod.OPTICAL_FLOW_FARNEBACK: self._run_optical_flow,
             DICMethod.PHASE_CORRELATION: self._run_phase_correlation,
@@ -286,6 +330,13 @@ class DICEngine:
             raise ValueError(f"Unknown method: {self.params.method}")
 
         result = runner(ref_image, def_image, mask)
+
+        with self._lock:
+            cancelled = self._cancelled
+        if cancelled:
+            logger.info("DIC analysis cancelled by user; partial result discarded")
+            raise DICCancelledError("Analisi annullata dall'utente")
+
         result.computation_time_s = time.time() - t0
         result.method_used = self.params.method
         result.parameters = self.params
@@ -304,14 +355,208 @@ class DICEngine:
             result.magnitude[border_mask] = np.nan
             result.correlation_quality[border_mask] = np.nan
             result.mask_valid[border_mask] = False
+            if 'point_class' in result.extra:
+                from dic_app.core.change_detection import NODATA
+                result.extra['point_class'][border_mask] = NODATA
             n_invalidated = int(np.sum(border_mask))
             if n_invalidated > 0:
                 logger.info(f"Border margin {bm}px: invalidated {n_invalidated} "
                              f"edge points")
 
+        if 'point_class' in result.extra:
+            from dic_app.core.change_detection import find_change_zones
+            lab_out = {}
+            best = np.fmax(result.extra.get('zncc_raw', result.correlation_quality),
+                           result.extra.get('zncc_norm', result.correlation_quality))
+            result.change_zones = find_change_zones(
+                result.extra['point_class'], best, result.grid_x, result.grid_y,
+                self.params.step_size, gsd,
+                min_points=self.params.min_change_points,
+                min_area_m2=self.params.min_change_area_m2 if gsd else 0.0,
+                half=self.params.subset_size // 2, label_out=lab_out)
+            result.extra['change_zone_id'] = lab_out['labels']
+
         logger.info(f"DIC completed in {result.computation_time_s:.1f}s "
                      f"using {self.params.method.value}")
         return result
+
+    # ------------------------------------------------------------------
+    # Algorithm 0: subset DIC, coarse-to-fine NCC + IC-GN (recommended)
+    # ------------------------------------------------------------------
+
+    def _run_icgn(self, ref, deformed, mask, surface=None) -> DICResult:
+        """Pyramid NCC initial guess -> IC-GN (affine subsets, ZNSSD).
+
+        With dual_correlation the points that the raw images cannot match
+        are retried on locally-normalised images: if they match there the
+        colour changed but not the shape (wet rock, shadow); if they match
+        in neither, the surface itself changed (possible detachment).
+        """
+        from dic_app.core import subset_dic as sd
+        from dic_app.core import change_detection as cd
+
+        p = self.params
+        half = p.subset_size // 2
+        step = max(1, p.step_size)
+        h, w = ref.shape
+        gy = np.arange(half, h - half, step)
+        gx = np.arange(half, w - half, step)
+        GX, GY = np.meshgrid(gx, gy)
+        ny, nx = GX.shape
+        cx, cy = GX.ravel(), GY.ravel()
+        n = cx.size
+        cancel = self._is_cancelled
+
+        # --- what is not rock / not analysable -------------------------
+        outside = (mask[cy, cx] == 0) if mask is not None else np.zeros(n, bool)
+        nodata_px = (ref == 0) | (deformed == 0)
+        if surface is not None and surface.shape == ref.shape:
+            veg_f = cd.subset_fraction(surface == cd.SURF_VEGETATION, cx, cy, half)
+            wat_f = cd.subset_fraction(surface == cd.SURF_WATER, cx, cy, half)
+            nodata_px = nodata_px | (surface == cd.SURF_NODATA)
+        else:
+            veg_f = np.zeros(n)
+            wat_f = np.zeros(n)
+        nod_f = cd.subset_fraction(nodata_px, cx, cy, half)
+        skip = outside | (veg_f > 0.3) | (wat_f > 0.3) | (nod_f > 0.05)
+
+        rf = ref.astype(np.float32)
+        side = 2 * half + 1
+        m1 = cv2.boxFilter(rf, -1, (side, side))
+        m2 = cv2.boxFilter(rf * rf, -1, (side, side))
+        sub_std = np.sqrt(np.maximum(m2 - m1 * m1, 0))[cy, cx]
+        texture_ok = sub_std >= p.texture_min_std
+        comp = np.nonzero(~skip)[0]
+
+        # --- 1. coarse-to-fine initial guess ----------------------------
+        max_disp = p.max_displacement_px or float(max(p.search_radius_x, p.search_radius_y))
+        self._report_progress(3, f"Stima iniziale a piramide (spostamento max {max_disp:.0f} px)...")
+        gu, gv, levels = sd.pyramid_guess(ref, deformed, GX, GY, half, max_disp,
+                                          radius=6, threads=p.threads, cancel=cancel)
+        if cancel():
+            return self._empty_result(ref.shape)
+        rad = 4 if levels > 0 else int(np.ceil(max_disp)) + 2
+        self._report_progress(20, f"Ricerca NCC su {comp.size} punti (raggio {rad} px)...")
+        u0 = np.full(n, np.nan)
+        v0 = np.full(n, np.nan)
+        pk = np.full(n, np.nan)
+        u0[comp], v0[comp], pk[comp] = sd.ncc_search(
+            ref, deformed, cx[comp], cy[comp], half, gu.ravel()[comp],
+            gv.ravel()[comp], rad, rad, threads=p.threads, cancel=cancel)
+        # Unreliable NCC matches get a guess from their neighbours: IC-GN
+        # then either converges (good) or reports a low correlation.
+        ug, vg = u0.reshape(ny, nx).copy(), v0.reshape(ny, nx).copy()
+        weak = ~(pk.reshape(ny, nx) > 0.5)
+        ug[weak] = np.nan
+        vg[weak] = np.nan
+        ugf, vgf, _ = sd.median_test_fill(ug, vg, threshold=3.0, eps=0.5)
+        ugf, vgf = sd._fill_nan_nearest(ugf), sd._fill_nan_nearest(vgf)
+        ui = np.where(np.isfinite(u0) & ~weak.ravel(), u0, ugf.ravel())
+        vi = np.where(np.isfinite(v0) & ~weak.ravel(), v0, vgf.ravel())
+        if cancel():
+            return self._empty_result(ref.shape)
+
+        # Subsets that touch the image edge, in the reference or once moved
+        # into the deformed image, are sampled outside the picture (and the
+        # gradients there are one-sided): they would look like a change.
+        # They are "no data", whatever the border margin.
+        pad = 2
+        with np.errstate(invalid='ignore'):
+            lost = ((cx - half - pad < 0) | (cx + half + pad > w - 1) |
+                    (cy - half - pad < 0) | (cy + half + pad > h - 1) |
+                    (cx + ui - half - pad < 0) | (cx + ui + half + pad > w - 1) |
+                    (cy + vi - half - pad < 0) | (cy + vi + half + pad > h - 1))
+        lost &= ~skip
+        if lost.any():
+            nod_f = nod_f.copy()
+            nod_f[lost] = 1.0
+            skip = skip | lost
+            comp = np.nonzero(~skip)[0]
+            logger.info(f"{int(lost.sum())} points at the image edge -> no data")
+
+        # --- 2. IC-GN on the raw images ---------------------------------
+        self._report_progress(40, "Rifinitura IC-GN (subset deformabili)...")
+        df = deformed.astype(np.float32)
+        res = sd.icgn_refine(rf, df, cx[comp], cy[comp], half, ui[comp], vi[comp],
+                             max_iter=p.icgn_max_iter, threads=p.threads, cancel=cancel)
+        fields_ = ('u', 'v', 'ux', 'uy', 'vx', 'vy')
+        out = {k: np.full(n, np.nan) for k in fields_}
+        for k in fields_:
+            out[k][comp] = res[k]
+        z_raw = np.full(n, np.nan)
+        z_raw[comp] = res['zncc']
+        z_norm = np.full(n, np.nan)
+        used_norm = np.zeros(n, bool)
+        thr = p.correlation_threshold
+
+        # --- 3. dual correlation on locally-normalised images ----------
+        if p.dual_correlation and not cancel():
+            self._report_progress(70, "Doppia correlazione (cambi di colore / bagnato)...")
+            sig = p.normalize_sigma or max(3.0, p.subset_size / 4.0)
+            rn = sd.local_normalize(ref, sig)
+            dn = sd.local_normalize(deformed, sig)
+            warp_all = np.full((n, 3, 3), np.nan)
+            warp_all[comp] = res['warp']
+            z_norm = sd.zncc_at_warp(rn, dn, cx, cy, half, warp_all)
+            redo = comp[~(z_raw[comp] >= thr)]
+            if redo.size:
+                res2 = sd.icgn_refine(rn, dn, cx[redo], cy[redo], half, ui[redo], vi[redo],
+                                      max_iter=p.icgn_max_iter, threads=p.threads,
+                                      cancel=cancel)
+                better = np.nan_to_num(res2['zncc'], nan=-1) > np.nan_to_num(z_norm[redo], nan=-1)
+                z_norm[redo[better]] = res2['zncc'][better]
+                take = better & (res2['zncc'] >= thr)
+                for k in fields_:
+                    out[k][redo[take]] = res2[k][take]
+                used_norm[redo[take]] = True
+
+        # --- 4. classes ---------------------------------------------------
+        self._report_progress(92, "Classificazione roccia / cambiamenti...")
+        cls = cd.classify_points(z_raw, z_norm, texture_ok, veg_f, wat_f, nod_f,
+                                 outside, valid_threshold=thr,
+                                 change_threshold=p.change_threshold)
+        measured = (cls == cd.VALID) | (cls == cd.APPEARANCE)
+        # Plausibility checks on measured vectors (a wrong match on
+        # repetitive texture can still correlate well):
+        #  - not larger than the declared maximum displacement (+ margin)
+        #  - coherent with the neighbours (normalised median test, 5x5)
+        # Rejected vectors become UNRELIABLE, never filled.
+        mag0 = np.hypot(out['u'], out['v'])
+        too_big = measured & (mag0 > 1.5 * max_disp + 3)
+        ug = np.where(measured & ~too_big, out['u'], np.nan).reshape(ny, nx)
+        vg = np.where(measured & ~too_big, out['v'], np.nan).reshape(ny, nx)
+        incoherent = sd.median_outliers(ug, vg, threshold=3.0, eps=0.2).ravel() & measured
+        bad = too_big | incoherent
+        if bad.any():
+            logger.info(f"Plausibility: {int(too_big.sum())} vectors above the max "
+                        f"displacement, {int((incoherent & ~too_big).sum())} incoherent "
+                        f"with neighbours -> uncertain")
+        cls[bad] = cd.UNRELIABLE
+        measured &= ~bad
+        u = np.where(measured, out['u'], np.nan)
+        v = np.where(measured, out['v'], np.nan)
+        quality = np.where(used_norm, z_norm, z_raw)
+        quality = np.where(np.isnan(quality), np.fmax(z_raw, z_norm), quality)
+
+        G = lambda a: a.reshape(ny, nx)  # noqa: E731
+        u, v = G(u), G(v)
+        extra = {
+            'point_class': G(cls).astype(np.uint8),
+            'zncc_raw': G(z_raw).astype(np.float32),
+            'zncc_norm': G(z_norm).astype(np.float32),
+            'ux': G(np.where(measured, out['ux'], np.nan)).astype(np.float32),
+            'uy': G(np.where(measured, out['uy'], np.nan)).astype(np.float32),
+            'vx': G(np.where(measured, out['vx'], np.nan)).astype(np.float32),
+            'vy': G(np.where(measured, out['vy'], np.nan)).astype(np.float32),
+        }
+        counts = cd.class_counts(extra['point_class'])
+        logger.info("IC-GN classes: " + ", ".join(f"{k} {v:.1f}%" for k, v in counts.items() if v > 0))
+        self._report_progress(100, "Analisi completata")
+        return DICResult(
+            u=u, v=v, magnitude=compute_magnitude(u, v),
+            correlation_quality=G(quality),
+            grid_x=GX, grid_y=GY, mask_valid=~np.isnan(u), extra=extra,
+        )
 
     # ------------------------------------------------------------------
     # Algorithm 1: Template Matching (NCC)
@@ -532,19 +777,28 @@ class DICEngine:
                 py_vals = np.arange(y0, y1).astype(np.float64)
                 px_vals = np.arange(x0, x1).astype(np.float64)
 
-                if patch.shape[0] >= 3 and patch.shape[1] >= 3:
+                # a cubic spline needs at least 4 samples per axis
+                if patch.shape[0] >= 4 and patch.shape[1] >= 4:
                     spline = RectBivariateSpline(
                         py_vals, px_vals, patch, kx=3, ky=3)
 
                     def neg_corr(xy):
-                        return -float(spline(xy[1], xy[0]))
+                        # .ev() returns a scalar; spline(y, x) returns a
+                        # (1, 1) array, which float() rejects in NumPy >= 2.5
+                        return -float(spline.ev(xy[1], xy[0]))
 
                     res = minimize(neg_corr, [float(peak_x), float(peak_y)],
                                    method='Nelder-Mead',
                                    options={'xatol': 0.001, 'fatol': 1e-8})
-                    sub_x, sub_y = res.x[0], res.x[1]
-            except ImportError:
-                pass
+                    # The integer peak is the best pixel, so the true
+                    # maximum lies within +/-0.5 px; the spline can drift
+                    # outside the 5x5 patch where it extrapolates badly.
+                    if np.all(np.isfinite(res.x)):
+                        sub_x = float(np.clip(res.x[0], peak_x - 0.5, peak_x + 0.5))
+                        sub_y = float(np.clip(res.x[1], peak_y - 0.5, peak_y + 0.5))
+            except Exception:
+                # fall back to the integer peak rather than failing the run
+                sub_x, sub_y = float(peak_x), float(peak_y)
 
         return sub_x, sub_y
 
@@ -599,8 +853,10 @@ class DICEngine:
         # Post-hoc correlation quality estimation
         quality = self._compute_posthoc_ncc(ref, deformed, u, v, grid_x, grid_y)
 
-        # Apply correlation threshold
-        low_quality = quality < self.params.correlation_threshold
+        # Apply correlation threshold.  NaN quality (subset displaced out
+        # of the image, flat patch) means the vector could not be verified,
+        # so it is invalid too (NaN < threshold is False and would keep it).
+        low_quality = np.isnan(quality) | (quality < self.params.correlation_threshold)
         u[low_quality] = np.nan
         v[low_quality] = np.nan
 
@@ -727,25 +983,37 @@ class DICEngine:
                 if ref_win.shape != hanning.shape or def_win.shape != hanning.shape:
                     processed += 1
                     continue
+                # no-data (black) or flat windows give meaningless shifts
+                if (ref_win.std() < 1.0 or def_win.std() < 1.0
+                        or np.mean(ref_win == 0) > 0.05 or np.mean(def_win == 0) > 0.05):
+                    processed += 1
+                    continue
 
                 ref_win *= hanning
                 def_win *= hanning
 
+                # Both phase-correlation routines return the shift that
+                # *registers* def_win onto ref_win, i.e. the negative of
+                # the displacement.  Negate it so the sign convention
+                # matches the other methods (u = x_def - x_ref).
                 if phase_cross_correlation is not None:
-                    shift, error, diffphase = phase_cross_correlation(
-                        ref_win, def_win,
-                        upsample_factor=upsample,
-                        return_error=True
-                    )
-                    v[iy, ix] = shift[0]
-                    u[iy, ix] = shift[1]
-                    quality[iy, ix] = 1.0 - error if error <= 1.0 else 0.0
+                    # No 'return_error' kwarg: it is deprecated/removed in
+                    # recent scikit-image; all supported versions return
+                    # (shift, error, phasediff) by default.
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        shift, _error, _diffphase = phase_cross_correlation(
+                            ref_win, def_win,
+                            upsample_factor=upsample,
+                        )
+                    v[iy, ix] = -shift[0]
+                    u[iy, ix] = -shift[1]
                 else:
                     # Basic FFT phase correlation
-                    shift, corr_peak = self._basic_phase_correlation(ref_win, def_win)
-                    v[iy, ix] = shift[0]
-                    u[iy, ix] = shift[1]
-                    quality[iy, ix] = corr_peak
+                    shift, _corr_peak = self._basic_phase_correlation(ref_win, def_win)
+                    v[iy, ix] = -shift[0]
+                    u[iy, ix] = -shift[1]
 
                 processed += 1
 
@@ -753,6 +1021,13 @@ class DICEngine:
                 (processed / total) * 100,
                 f"Phase correlation: row {iy + 1}/{ny}"
             )
+
+        # Quality = ZNCC of the matched subsets, same metric as the other
+        # methods.  (skimage's phase-normalised 'error' is ~1 for every
+        # window, so 1 - error was ~0 and every point failed the threshold.)
+        quality = self._compute_posthoc_ncc(ref, deformed, u, v, grid_x, grid_y)
+        u[np.isnan(quality)] = np.nan
+        v[np.isnan(quality)] = np.nan
 
         # Apply threshold
         low_q = quality < self.params.correlation_threshold
@@ -771,7 +1046,11 @@ class DICEngine:
 
     @staticmethod
     def _basic_phase_correlation(ref_win, def_win):
-        """Basic FFT phase correlation fallback."""
+        """Basic FFT phase correlation fallback.
+
+        Returns the registration shift (same convention as
+        skimage's phase_cross_correlation), i.e. minus the displacement.
+        """
         f_ref = np.fft.fft2(ref_win)
         f_def = np.fft.fft2(def_win)
         cross_power = f_ref * np.conj(f_def)
@@ -845,6 +1124,24 @@ class DICEngine:
         pts_def = np.array([kp_def[m.trainIdx].pt for m in good_matches])
         disp_u = pts_def[:, 0] - pts_ref[:, 0]
         disp_v = pts_def[:, 1] - pts_ref[:, 1]
+        # Reject wrong matches before interpolating: a match whose
+        # displacement disagrees with its nearest neighbours' median is an
+        # outlier (otherwise interpolation spreads it over stable rock).
+        from scipy.spatial import cKDTree as _KD
+        if len(pts_ref) >= 12:
+            k = min(9, len(pts_ref))
+            _, nn = _KD(pts_ref).query(pts_ref, k=k)
+            nu = np.median(disp_u[nn[:, 1:]], axis=1)
+            nv = np.median(disp_v[nn[:, 1:]], axis=1)
+            dev = np.hypot(disp_u - nu, disp_v - nv)
+            mad = np.median(dev) * 1.4826
+            keep = dev <= max(3.0 * mad, 1.5)
+            if keep.sum() >= 4:
+                logger.info(f"Feature matching: {int((~keep).sum())} inconsistent "
+                            f"matches rejected")
+                pts_ref, pts_def = pts_ref[keep], pts_def[keep]
+                disp_u, disp_v = disp_u[keep], disp_v[keep]
+                good_matches = [m for m, kk in zip(good_matches, keep) if kk]
         max_dist = max(m.distance for m in good_matches) if good_matches else 1.0
         max_dist = max(max_dist, 1.0)  # avoid division by zero
         match_quality = np.array([1.0 - m.distance / max_dist for m in good_matches])
@@ -1014,25 +1311,27 @@ class DICSequenceRunner:
         if not self.results:
             return None
 
+        # Cumulative displacement = SUM of the increments.  A grid point is
+        # valid only if every increment is valid there: a missing step
+        # makes the total unknown (treating it as 0 would underestimate it).
+        # Note: increments are summed at fixed grid nodes (Eulerian), which
+        # is accurate as long as each increment is small vs the grid step.
         cum_u = np.zeros_like(self.results[0].u)
         cum_v = np.zeros_like(self.results[0].v)
-        cum_weights = np.zeros_like(self.results[0].u)
+        all_valid = np.ones(self.results[0].u.shape, dtype=bool)
         min_quality = np.ones_like(self.results[0].correlation_quality)
 
         for result in self.results:
-            valid = ~np.isnan(result.u)
+            valid = ~(np.isnan(result.u) | np.isnan(result.v))
+            all_valid &= valid
+            cum_u[valid] += result.u[valid]
+            cum_v[valid] += result.v[valid]
             q = np.nan_to_num(result.correlation_quality, nan=0)
-            mean_q = float(np.nanmean(q[valid])) if np.any(valid) else 0.5
-            weight = max(mean_q, 0.1)  # floor to avoid zero weight
-            cum_u[valid] += result.u[valid] * weight
-            cum_v[valid] += result.v[valid] * weight
-            cum_weights[valid] += weight
             min_quality = np.minimum(min_quality, q)
 
-        # Normalize by cumulative weights
-        nonzero = cum_weights > 0
-        cum_u[nonzero] /= cum_weights[nonzero]
-        cum_v[nonzero] /= cum_weights[nonzero]
+        cum_u[~all_valid] = np.nan
+        cum_v[~all_valid] = np.nan
+        min_quality[~all_valid] = np.nan
 
         cum_magnitude = compute_magnitude(cum_u, cum_v)
         mask_valid = ~np.isnan(cum_u)

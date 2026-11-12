@@ -63,11 +63,26 @@ class ROIEditorWidget(QWidget):
         # Status label
         self.status_label = QLabel("Seleziona uno strumento e clicca sull'immagine")
         viewer_layout.addWidget(self.status_label)
+        self.coverage_label = QLabel()
+        self.coverage_label.setStyleSheet(
+            "font-weight: bold; padding: 3px; background-color: #e8eaf6;")
+        viewer_layout.addWidget(self.coverage_label)
         main_layout.addWidget(viewer_group, stretch=3)
 
         # --- Drawing tools ---
         tools_group = QGroupBox("Strumenti Disegno")
         tools_layout = QVBoxLayout(tools_group)
+        help_lbl = QLabel(
+            "<b>Come funziona:</b> senza ROI si analizza tutta l'immagine. "
+            "<span style='color:#2e7d32'><b>Includi</b></span>: se ne disegni "
+            "almeno una, si analizza <i>solo</i> dentro le zone verdi. "
+            "<span style='color:#c62828'><b>Escludi</b></span>: le zone rosse "
+            "non si analizzano mai (vince sempre su Includi) - usala per cielo, "
+            "vegetazione, strade, reti paramassi, ombre mobili. Le ROI restano "
+            "al loro posto anche se rifai l'allineamento.")
+        help_lbl.setWordWrap(True)
+        help_lbl.setStyleSheet("font-size: 11px; color: #37474f;")
+        tools_layout.addWidget(help_lbl)
 
         # Shape selection
         shape_row = QHBoxLayout()
@@ -161,19 +176,36 @@ class ROIEditorWidget(QWidget):
 
         main_layout.addWidget(list_group)
 
-    def set_image(self, image_gray, image_shape=None):
-        """Set the image and initialize mask manager."""
+    def set_image(self, image_gray, image_shape=None, frame_offset=(0, 0)):
+        """Set the image and initialize mask manager.
+
+        frame_offset : (x, y) of this image inside the original reference
+        photo (alignment crop origin).  Existing ROIs are translated onto
+        the new image instead of being dropped.
+        """
         if image_gray is not None:
             self.viewer.set_image(image_gray)
             self.viewer.fit_in_view()
-            shape = image_gray.shape[:2]
-            if self._mask_manager is None or self._mask_manager.image_shape != shape:
-                self._mask_manager = MaskManager(shape)
+            shape = tuple(image_gray.shape[:2])
+            offset = tuple(int(v) for v in frame_offset)
+            mm = self._mask_manager
+            if mm is None:
+                self._mask_manager = MaskManager(shape, offset)
+            elif tuple(mm.image_shape) != shape or mm.frame_offset != offset:
+                if mm.frame_offset is not None and len(mm) > 0:
+                    self._mask_manager = mm.reframed(shape, offset)
+                else:
+                    self._mask_manager = MaskManager(shape, offset)
+            self._refresh_roi_table()
             self._update_overlay()
 
     def set_mask_manager(self, manager):
         """Set an existing mask manager (e.g., from project load)."""
         self._mask_manager = manager
+        # continue numbering after the existing ROIs (no duplicate names)
+        nums = [int(r.name[4:]) for r in manager.rois
+                if r.name.startswith("ROI_") and r.name[4:].isdigit()] if manager else []
+        self._roi_counter = max(nums, default=0)
         self._refresh_roi_table()
         self._update_overlay()
 
@@ -350,11 +382,10 @@ class ROIEditorWidget(QWidget):
             color_vertex = (255, 0, 0, 255)       # Red bright vertex
             color_dash = (180, 0, 0, 150)         # Red dashed
 
-        # Convert colors for cv2 (BGRA)
-        line_bgra = (color_line[2], color_line[1], color_line[0], color_line[3])
-        fill_bgra = (color_fill[2], color_fill[1], color_fill[0], color_fill[3])
-        vert_bgra = (color_vertex[2], color_vertex[1], color_vertex[0], color_vertex[3])
-        dash_bgra = (color_dash[2], color_dash[1], color_dash[0], color_dash[3])
+        # The overlay is RGBA (ImageViewer.set_overlay): use the colours as
+        # they are (a BGRA swap made the "exclude" preview blue)
+        line_bgra, fill_bgra, vert_bgra, dash_bgra = (
+            color_line, color_fill, color_vertex, color_dash)
 
         if mode in (ROIType.POLYGON, ROIType.FREEHAND):
             # Draw filled preview polygon (points + mouse as closing vertex)
@@ -490,12 +521,31 @@ class ROIEditorWidget(QWidget):
 
     def _update_overlay(self):
         """Update ROI overlay on the viewer and refresh cache."""
+        self._update_coverage()
         if self._mask_manager and len(self._mask_manager) > 0:
             self._cached_roi_overlay = self._mask_manager.get_roi_overlay(alpha=0.3)
             self.viewer.set_overlay(self._cached_roi_overlay)
         else:
             self._cached_roi_overlay = None
             self.viewer.clear_overlay()
+
+    def _update_coverage(self):
+        mm = self._mask_manager
+        if mm is None:
+            self.coverage_label.setText("")
+            return
+        if len(mm) == 0:
+            self.coverage_label.setText(
+                "Area analizzata: 100% (nessuna ROI: tutta l'immagine)")
+            return
+        pct = mm.coverage_percent()
+        n_in = sum(1 for r in mm.rois if r.mode == ROIMode.INCLUDE)
+        n_out = len(mm) - n_in
+        txt = (f"Area analizzata: {pct:.0f}% dell'immagine "
+               f"({n_in} da includere, {n_out} da escludere)")
+        if pct < 0.5:
+            txt += "  -  ATTENZIONE: non resta nulla da analizzare"
+        self.coverage_label.setText(txt)
 
     # ------------------------------------------------------------------
     # Import / Export

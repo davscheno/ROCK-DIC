@@ -78,10 +78,12 @@ class GeoReferencer:
         dx_m = dx_px * gsd
         dy_m = dy_px * gsd
 
-        # Rotate by bearing
+        # Rotate by bearing (clockwise from north): the image "up" axis
+        # (0, 1) must map to (sin b, cos b) in (east, north) and the image
+        # "right" axis (1, 0) to (cos b, -sin b).
         bearing_rad = math.radians(image_bearing)
-        east_m = dx_m * math.cos(bearing_rad) - dy_m * math.sin(bearing_rad)
-        north_m = dx_m * math.sin(bearing_rad) + dy_m * math.cos(bearing_rad)
+        east_m = dx_m * math.cos(bearing_rad) + dy_m * math.sin(bearing_rad)
+        north_m = -dx_m * math.sin(bearing_rad) + dy_m * math.cos(bearing_rad)
 
         # Approximate conversion to lat/lon offset
         lat_offset = north_m / 111320.0
@@ -134,7 +136,10 @@ class GeoReferencer:
                        image_shape: Tuple[int, int],
                        image_bearing: float = 0.0,
                        nodata: float = -9999.0,
-                       epsg: int = 4326):
+                       epsg: int = 4326,
+                       grid_x: np.ndarray = None,
+                       grid_y: np.ndarray = None,
+                       pixel_offset: Tuple[float, float] = (0.0, 0.0)):
         """Write a georeferenced GeoTIFF from displacement/strain data.
 
         Parameters
@@ -143,14 +148,20 @@ class GeoReferencer:
         filepath : str, output path
         gps_origin : GPSData, GPS position of image center
         gsd : float, meters/pixel
-        image_shape : (H, W) of original image
+        image_shape : (H, W) of the ORIGINAL (uncropped) image whose
+            centre the GPS position refers to
         image_bearing : degrees clockwise from north
         nodata : float, value for no-data pixels
         epsg : int, EPSG code for output CRS
+        grid_x, grid_y : (NY, NX) pixel coordinates of the DIC grid nodes
+            in the analysed image.  If omitted the grid is assumed to
+            cover the whole image uniformly (legacy behaviour).
+        pixel_offset : (x0, y0) position of the analysed image inside the
+            original image (e.g. the alignment crop box origin)
         """
         try:
             import rasterio
-            from rasterio.transform import from_bounds
+            from rasterio.transform import Affine
             from rasterio.crs import CRS
         except ImportError:
             logger.warning("rasterio not installed; GeoTIFF export unavailable")
@@ -162,24 +173,31 @@ class GeoReferencer:
 
         h_img, w_img = image_shape
         ny, nx = data.shape
+        ox, oy = pixel_offset
 
-        # Compute geographic bounds
-        corners = [
-            (0, 0), (w_img, 0), (w_img, h_img), (0, h_img)
-        ]
-        lons, lats = [], []
-        for px, py in corners:
-            lon, lat = self.pixel_to_geo(
-                px, py, gps_origin, gsd, image_shape, image_bearing)
-            lons.append(lon)
-            lats.append(lat)
+        # Pixel geometry of the raster cells: cell (r, c) is centred on the
+        # grid node (grid_x[r, c], grid_y[r, c]) of the analysed image.
+        if grid_x is not None and grid_y is not None and nx > 1 and ny > 1:
+            step_x = float(grid_x[0, 1] - grid_x[0, 0])
+            step_y = float(grid_y[1, 0] - grid_y[0, 0])
+            x_first = float(grid_x[0, 0]) + ox
+            y_first = float(grid_y[0, 0]) + oy
+        else:
+            step_x = w_img / nx
+            step_y = h_img / ny
+            x_first = step_x / 2.0
+            y_first = step_y / 2.0
 
-        west = min(lons)
-        east = max(lons)
-        south = min(lats)
-        north = max(lats)
-
-        transform = from_bounds(west, south, east, north, nx, ny)
+        # Affine transform from three corners (handles any bearing,
+        # unlike an axis-aligned bounding box).
+        x_tl, y_tl = x_first - step_x / 2.0, y_first - step_y / 2.0
+        geo = lambda px, py: self.pixel_to_geo(  # noqa: E731
+            px, py, gps_origin, gsd, image_shape, image_bearing)
+        lon0, lat0 = geo(x_tl, y_tl)
+        lon_c, lat_c = geo(x_tl + step_x, y_tl)   # one column to the right
+        lon_r, lat_r = geo(x_tl, y_tl + step_y)   # one row down
+        transform = Affine(lon_c - lon0, lon_r - lon0, lon0,
+                           lat_c - lat0, lat_r - lat0, lat0)
 
         # Replace NaN with nodata
         data_out = np.where(np.isnan(data), nodata, data).astype(np.float32)

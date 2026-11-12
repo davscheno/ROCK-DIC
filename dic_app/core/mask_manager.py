@@ -64,14 +64,50 @@ class MaskManager:
     The final mask is uint8: 255 = analyze, 0 = skip.
     """
 
-    def __init__(self, image_shape: Tuple[int, int]):
+    def __init__(self, image_shape: Tuple[int, int],
+                 frame_offset: Optional[Tuple[int, int]] = (0, 0)):
         """
         Parameters
         ----------
-        image_shape : (height, width)
+        image_shape : (height, width) of the image the ROIs are drawn on
+        frame_offset : (x, y) of that image's origin inside the ORIGINAL
+            (unaligned) reference photo.  (0, 0) = drawn on the original
+            photo; after alignment the reference is a crop and the offset is
+            the crop origin.  None = unknown (projects saved before this
+            field existed).
         """
-        self.image_shape = image_shape
+        self.image_shape = tuple(int(v) for v in image_shape[:2])
+        self.frame_offset = (None if frame_offset is None
+                             else (int(frame_offset[0]), int(frame_offset[1])))
         self.rois: List[ROIDefinition] = []
+
+    # ------------------------------------------------------------------
+    # Coordinate frame
+    # ------------------------------------------------------------------
+
+    def reframed(self, image_shape, frame_offset) -> 'MaskManager':
+        """Same ROIs expressed in another frame of the reference photo.
+
+        Alignment crops the reference: the ROIs are translated by the
+        difference of the two origins (exact, the crop is a translation),
+        so ROIs drawn before and after the alignment stay on the same rock.
+        Requires a known ``frame_offset``.
+        """
+        if self.frame_offset is None:
+            raise ValueError("frame offset unknown")
+        dx = self.frame_offset[0] - int(frame_offset[0])
+        dy = self.frame_offset[1] - int(frame_offset[1])
+        out = MaskManager(image_shape, frame_offset)
+        for roi in self.rois:
+            pts = [(int(x) + dx, int(y) + dy) for x, y in roi.points]
+            out.rois.append(ROIDefinition(roi.roi_type, roi.mode, pts,
+                                          roi.name, roi.color))
+        return out
+
+    def coverage_percent(self) -> float:
+        """Share of the image that will be analysed (0-100)."""
+        mask = self.generate_mask()
+        return 100.0 * float(np.count_nonzero(mask)) / max(mask.size, 1)
 
     def add_roi(self, roi: ROIDefinition):
         """Add an ROI definition after validation."""
@@ -163,7 +199,11 @@ class MaskManager:
         """
         overlay = np.zeros((*self.image_shape, 4), dtype=np.uint8)
 
-        for roi in self.rois:
+        # Same order as generate_mask(): INCLUDE first, EXCLUDE on top, so
+        # what is shown is what is analysed.
+        ordered = ([r for r in self.rois if r.mode == ROIMode.INCLUDE]
+                   + [r for r in self.rois if r.mode == ROIMode.EXCLUDE])
+        for roi in ordered:
             pts = np.array(roi.points, dtype=np.int32)
             if roi.mode == ROIMode.INCLUDE:
                 color = (0, 200, 0, int(alpha * 255))
@@ -222,57 +262,72 @@ class MaskManager:
         if mask is None:
             raise IOError(f"Failed to load mask: {filepath}")
 
-        # Resize if needed
-        if mask.shape != self.image_shape:
-            mask = cv2.resize(mask, (self.image_shape[1], self.image_shape[0]))
+        # Resize if needed (nearest: a mask must stay binary)
+        if mask.shape != tuple(self.image_shape):
+            logger.warning(f"Mask {mask.shape} resized to {self.image_shape}: "
+                           f"it must have been drawn on an image of the same "
+                           f"framing, otherwise it will not coincide")
+            mask = cv2.resize(mask, (self.image_shape[1], self.image_shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
 
         # Threshold
         _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
 
-        # Find contours and add as polygon ROIs
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Outer contours -> INCLUDE polygons, holes -> EXCLUDE polygons.
+        # Simplified to 1 px so the imported mask matches the PNG.
+        contours, hierarchy = cv2.findContours(
+            mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            return
         for i, contour in enumerate(contours):
-            if cv2.contourArea(contour) > 10:
-                # Simplify contour
-                epsilon = 0.005 * cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                points = [(int(p[0][0]), int(p[0][1])) for p in approx]
-                roi = ROIDefinition(
-                    roi_type=ROIType.POLYGON,
-                    mode=ROIMode.INCLUDE,
-                    points=points,
-                    name=f"Imported_{i}",
-                )
-                self.add_roi(roi)
+            if cv2.contourArea(contour) <= 10:
+                continue
+            is_hole = hierarchy[0][i][3] >= 0
+            approx = cv2.approxPolyDP(contour, 1.0, True)
+            points = [(int(p[0][0]), int(p[0][1])) for p in approx]
+            roi = ROIDefinition(
+                roi_type=ROIType.POLYGON,
+                mode=ROIMode.EXCLUDE if is_hole else ROIMode.INCLUDE,
+                points=points,
+                name=f"Imported_{'hole' if is_hole else 'area'}_{i}",
+            )
+            self.add_roi(roi)
 
     def export_rois(self, filepath: str):
         """Export ROI definitions to JSON."""
-        data = {
-            'image_shape': list(self.image_shape),
-            'rois': [roi.to_dict() for roi in self.rois],
-        }
         with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(self.to_dict(), f, indent=2)
 
     def import_rois(self, filepath: str):
-        """Import ROI definitions from JSON."""
+        """Import ROI definitions from JSON.
+
+        If the file records the frame it was drawn in (``frame_offset``)
+        the ROIs are translated onto this manager's frame.
+        """
         with open(filepath, 'r') as f:
             data = json.load(f)
-        for roi_data in data.get('rois', []):
-            self.add_roi(ROIDefinition.from_dict(roi_data))
+        src = MaskManager.from_dict(data, self.image_shape)
+        if src.frame_offset is not None and self.frame_offset is not None:
+            src = src.reframed(self.image_shape, self.frame_offset)
+        for roi in src.rois:
+            self.add_roi(roi)
 
     def to_dict(self):
         """Serialize for project state."""
-        return {
+        d = {
             'image_shape': list(self.image_shape),
             'rois': [roi.to_dict() for roi in self.rois],
         }
+        if self.frame_offset is not None:
+            d['frame_offset'] = list(self.frame_offset)
+        return d
 
     @classmethod
     def from_dict(cls, d, image_shape=None):
         """Deserialize from project state."""
         shape = tuple(d.get('image_shape', image_shape or (0, 0)))
-        manager = cls(shape)
+        off = d.get('frame_offset')          # absent in older projects
+        manager = cls(shape, tuple(off) if off is not None else None)
         for roi_data in d.get('rois', []):
             manager.add_roi(ROIDefinition.from_dict(roi_data))
         return manager

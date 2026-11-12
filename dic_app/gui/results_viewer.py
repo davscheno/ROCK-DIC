@@ -16,6 +16,8 @@ matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from dic_app.gui.image_viewer import ImageViewer
+from dic_app.gui.detachment_drawer import DetachmentDrawer
+from dic_app.core import detachment as dt
 from dic_app.core.dic_engine import DICResult
 from dic_app.core.postprocessing import (
     DisplacementSmoother, StrainCalculator, DisplacementStatistics
@@ -40,6 +42,7 @@ class ResultsViewerWidget(QWidget):
     """
 
     zones_detected = pyqtSignal(list)  # emits list of active zone dicts
+    gsd_changed = pyqtSignal(float)    # GSD edited in the results panel (0 = none)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -94,6 +97,28 @@ class ResultsViewerWidget(QWidget):
         # --- Right: Controls ---
         right_panel = QVBoxLayout()
 
+        # Scale (GSD): metric values of statistics, zones and detachments
+        gsd_group = QGroupBox("Scala dell'immagine (GSD)")
+        gsd_layout = QFormLayout(gsd_group)
+        self.gsd_spin = QDoubleSpinBox()
+        self.gsd_spin.setRange(0.0, 10.0)
+        self.gsd_spin.setDecimals(4)
+        self.gsd_spin.setSingleStep(0.001)
+        self.gsd_spin.setSuffix(" m/px")
+        self.gsd_spin.setSpecialValueText("non impostato (solo pixel)")
+        self.gsd_spin.setKeyboardTracking(False)      # update on Enter / focus out
+        self.gsd_spin.setToolTip(
+            "Dimensione a terra di un pixel. Cambiandolo si aggiornano subito "
+            "mm, m² di statistiche, zone, distacchi e report. "
+            "E' lo stesso valore della scheda Progetto.")
+        self.gsd_spin.valueChanged.connect(self._on_gsd_spin_changed)
+        gsd_layout.addRow("GSD:", self.gsd_spin)
+        self.gsd_hint = QLabel()
+        self.gsd_hint.setStyleSheet("font-size: 11px; color: #555;")
+        gsd_layout.addRow(self.gsd_hint)
+        right_panel.addWidget(gsd_group)
+        self._update_gsd_hint()
+
         # Display options
         display_group = QGroupBox("Visualizzazione")
         display_layout = QFormLayout(display_group)
@@ -103,6 +128,8 @@ class ResultsViewerWidget(QWidget):
         self.field_combo.addItem("Spostamento U (orizzontale)", "u")
         self.field_combo.addItem("Spostamento V (verticale)", "v")
         self.field_combo.addItem("Qualita Correlazione", "quality")
+        self.field_combo.addItem("Classi: roccia / distacchi / vegetazione", "classes")
+        self.field_combo.addItem("Correlazione normalizzata (bagnato/ombre)", "zncc_norm")
         self.field_combo.currentIndexChanged.connect(self._update_display)
         display_layout.addRow("Campo:", self.field_combo)
 
@@ -334,9 +361,12 @@ class ResultsViewerWidget(QWidget):
         grid_row.addWidget(self.btn_grid_inspection)
         zone_layout.addRow(grid_row)
 
-        self.zone_table = QTableWidget(0, 5)
+        self.zone_table = QTableWidget(0, 6)
         self.zone_table.setHorizontalHeaderLabels(
-            ["ID", "Area", "Max", "Media", "Stato"])
+            ["ID", "Area", "Max", "Media", "Distacco reale", "Stato"])
+        self.zone_table.setToolTip(
+            "Doppio clic su una zona per ispezionarla e disegnare il "
+            "perimetro reale del distacco.")
         self.zone_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.Stretch)
         self.zone_table.setMaximumHeight(140)
@@ -346,6 +376,45 @@ class ResultsViewerWidget(QWidget):
         zone_layout.addRow(self.zone_table)
 
         right_panel.addWidget(zone_group)
+
+        # Detachments / surface changes (IC-GN)
+        change_group = QGroupBox("Distacchi e cambiamenti di superficie")
+        change_layout = QVBoxLayout(change_group)
+        self.change_info = QLabel(
+            "Disponibile con il metodo IC-GN: zone dove la roccia non e' piu' "
+            "riconoscibile (possibili distacchi).")
+        self.change_info.setWordWrap(True)
+        self.change_info.setStyleSheet("color: #555;")
+        change_layout.addWidget(self.change_info)
+        self.show_change_outline = QCheckBox("Evidenzia i distacchi sulla mappa")
+        self.show_change_outline.setChecked(True)
+        self.show_change_outline.toggled.connect(self._update_display)
+        change_layout.addWidget(self.show_change_outline)
+        self.show_real_detachments = QCheckBox(
+            "Mostra i perimetri reali dei distacchi (disegnati)")
+        self.show_real_detachments.setChecked(True)
+        self.show_real_detachments.toggled.connect(self._update_display)
+        change_layout.addWidget(self.show_real_detachments)
+        self.change_table = QTableWidget(0, 5)
+        self.change_table.setHorizontalHeaderLabels(
+            ["ID", "Area", "Distacco reale", "Corr.", "Stato"])
+        self.change_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.change_table.setMaximumHeight(150)
+        self.change_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.change_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.change_table.cellDoubleClicked.connect(
+            lambda r, c: self._open_change_validation(start=r))
+        change_layout.addWidget(self.change_table)
+        self.btn_validate_changes = QPushButton("Valida distacchi")
+        self.btn_validate_changes.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; padding: 6px; }")
+        self.btn_validate_changes.setToolTip(
+            "Rivedi ogni zona cambiata con le immagini prima/dopo e conferma "
+            "se e' un distacco reale o un falso allarme.")
+        self.btn_validate_changes.clicked.connect(lambda: self._open_change_validation())
+        self.btn_validate_changes.setEnabled(False)
+        change_layout.addWidget(self.btn_validate_changes)
+        right_panel.addWidget(change_group)
 
         # Statistics
         stats_group = QGroupBox("Statistiche")
@@ -396,18 +465,58 @@ class ResultsViewerWidget(QWidget):
         """Load a DIC result and display default visualization."""
         self._result = result
         self._base_image = base_image
-        self._gsd = gsd
+        self.set_gsd(gsd, refresh=False)
         self._smoothed_u = result.u.copy()
         self._smoothed_v = result.v.copy()
         self._strain_data = None
+        # Zones of a previous result live on another grid
+        self._active_zones = []
+        self._refresh_zone_table()
         self.strain_combo.setEnabled(False)
 
         if base_image is not None:
             self.viewer.set_image(base_image)
             self.viewer.fit_in_view()
 
+        self._refresh_change_table()
         self._update_display()
         self._update_statistics()
+
+    # ------------------------------------------------------------------
+    # GSD (scale)
+    # ------------------------------------------------------------------
+
+    def set_gsd(self, gsd, refresh=True):
+        """Set the scale from outside (project) without emitting."""
+        self._gsd = gsd if gsd and gsd > 0 else None
+        self.gsd_spin.blockSignals(True)
+        self.gsd_spin.setValue(self._gsd or 0.0)
+        self.gsd_spin.blockSignals(False)
+        self._apply_gsd(refresh)
+
+    def _on_gsd_spin_changed(self, value):
+        self._gsd = value if value > 0 else None
+        self._apply_gsd(True)
+        self.gsd_changed.emit(float(value))
+
+    def _apply_gsd(self, refresh):
+        """Recompute every metric value that depends on the GSD."""
+        dt.apply_gsd(self._gsd, self._active_zones, self.get_change_zones())
+        self._update_gsd_hint()
+        if refresh and self._result is not None:
+            self._refresh_zone_table()
+            self._refresh_change_table()
+            self._update_display()
+            self._update_statistics()
+
+    def _update_gsd_hint(self):
+        g = self._gsd
+        if g:
+            self.gsd_hint.setText(
+                f"1 px = {g * 1000:.1f} mm  |  1 m = {1 / g:.0f} px")
+        else:
+            self.gsd_hint.setText(
+                "Senza GSD spostamenti e aree restano in pixel.")
 
     def _get_current_field(self):
         """Get the currently selected display field."""
@@ -424,6 +533,11 @@ class ResultsViewerWidget(QWidget):
             return self._smoothed_v
         elif field_key == 'quality':
             return self._result.correlation_quality
+        elif field_key == 'zncc_norm':
+            return self._result.extra.get('zncc_norm',
+                                          self._result.correlation_quality)
+        elif field_key == 'classes':
+            return self._result.extra.get('point_class')
         return None
 
     def _update_display(self):
@@ -441,17 +555,15 @@ class ResultsViewerWidget(QWidget):
             vmin = self.vmin_spin.value()
             vmax = self.vmax_spin.value()
 
-        # Create heatmap at result grid resolution
-        heatmap_rgba = displacement_colormap(field, vmin=vmin, vmax=vmax, cmap=cmap)
-
-        # Upscale heatmap to image size
-        if self._base_image is not None:
-            h_img, w_img = self._base_image.shape[:2]
-            heatmap_upscaled = cv2.resize(
-                heatmap_rgba, (w_img, h_img),
-                interpolation=cv2.INTER_LINEAR)
+        field_key = self.field_combo.currentData()
+        if field_key == 'classes':
+            heatmap_rgba = self._class_rgba(field)
+            heatmap_upscaled = self._grid_to_image(heatmap_rgba, nearest=True)
         else:
-            heatmap_upscaled = heatmap_rgba
+            # Create heatmap at result grid resolution
+            heatmap_rgba = displacement_colormap(field, vmin=vmin, vmax=vmax, cmap=cmap)
+            # Place it on the image exactly where the grid nodes are
+            heatmap_upscaled = self._grid_to_image(heatmap_rgba)
 
         # Apply alpha
         heatmap_upscaled[:, :, 3] = (
@@ -462,7 +574,156 @@ class ResultsViewerWidget(QWidget):
         if self.show_vectors.isChecked() and self._result is not None:
             self._draw_vectors_on_overlay(heatmap_upscaled)
 
+        if self.show_change_outline.isChecked():
+            self._draw_change_outlines(heatmap_upscaled)
+
+        if self.show_real_detachments.isChecked():
+            self._draw_real_detachments(heatmap_upscaled)
+
         self.viewer.set_overlay(heatmap_upscaled)
+
+    def _draw_real_detachments(self, overlay):
+        """Perimeters of the real detachments drawn by the operator."""
+        zones = dt.live_zones(self._active_zones, self.get_change_zones())
+        th = max(2, overlay.shape[1] // 600)
+        for z in zones:
+            for d in dt.zone_detachments(z):
+                pts = np.asarray(d['points'], np.int32).reshape(-1, 1, 2)
+                # outline only: the displacement map inside stays visible
+                cv2.polylines(overlay, [pts], True, (0, 0, 0, 220), th + 2, cv2.LINE_AA)
+                cv2.polylines(overlay, [pts], True, (255, 235, 0, 255), th, cv2.LINE_AA)
+                lab = f"{dt.zone_label(z)}-R{d['id']}"
+                if d.get('area_m2') is not None:
+                    lab += f" {d['area_m2']:.1f}m2"
+                x, y = int(d['centroid'][0]), int(d['centroid'][1])
+                fs = max(0.5, th * 0.35)
+                cv2.putText(overlay, lab, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs,
+                            (0, 0, 0, 255), th + 2, cv2.LINE_AA)
+                cv2.putText(overlay, lab, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs,
+                            (255, 235, 0, 255), th, cv2.LINE_AA)
+
+    def _grid_to_image(self, grid_rgba, nearest=False):
+        """Map a per-grid-node RGBA image onto the base image pixels.
+
+        Grid node (i, j) is at pixel (grid_x[i, j], grid_y[i, j]); the grid
+        starts half a subset inside the image, so a plain resize to the
+        image size would shift the colours by up to half a subset.
+        """
+        h_img, w_img = self._base_image.shape[:2]
+        gx, gy = self._result.grid_x, self._result.grid_y
+        ny, nx = gx.shape
+        sx = float(gx[0, 1] - gx[0, 0]) if nx > 1 else 1.0
+        sy = float(gy[1, 0] - gy[0, 0]) if ny > 1 else 1.0
+        M = np.float32([[sx, 0, float(gx[0, 0])], [0, sy, float(gy[0, 0])]])
+        out = cv2.warpAffine(
+            grid_rgba, M, (w_img, h_img),
+            flags=cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE)
+        # transparent outside the area covered by the grid (+ half a cell)
+        x0 = int(max(0, gx[0, 0] - sx / 2)); x1 = int(min(w_img, gx[0, -1] + sx / 2 + 1))
+        y0 = int(max(0, gy[0, 0] - sy / 2)); y1 = int(min(h_img, gy[-1, 0] + sy / 2 + 1))
+        keep = np.zeros((h_img, w_img), bool)
+        keep[y0:y1, x0:x1] = True
+        out[~keep, 3] = 0
+        return out
+
+    @staticmethod
+    def _class_rgba(point_class):
+        from dic_app.core.change_detection import CLASS_COLORS, NODATA
+        rgba = np.zeros(point_class.shape + (4,), np.uint8)
+        for k, c in CLASS_COLORS.items():
+            m = point_class == k
+            rgba[m, :3] = c
+            rgba[m, 3] = 0 if k == NODATA else 255
+        return rgba
+
+    def _change_mask_grid(self):
+        if self._result is None or 'point_class' not in self._result.extra:
+            return None
+        from dic_app.core.change_detection import CHANGE
+        return (self._result.extra['point_class'] == CHANGE).astype(np.uint8)
+
+    def _draw_change_outlines(self, overlay):
+        """Outline + label of every (non-rejected) change zone, following
+        its real shape (not its bounding box)."""
+        zones = [z for z in getattr(self._result, 'change_zones', [])
+                 if z.get('status') != 'rejected']
+        zid = self._result.extra.get('change_zone_id') if self._result is not None else None
+        if not zones or zid is None:
+            return
+        th = max(2, overlay.shape[1] // 700)
+        for z in zones:
+            m = (zid == z['id']).astype(np.uint8) * 255
+            rgba = np.zeros(m.shape + (4,), np.uint8)
+            rgba[..., 3] = m
+            big = self._grid_to_image(rgba, nearest=True)[..., 3]
+            cnts, _ = cv2.findContours((big > 0).astype(np.uint8), cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            col = (0, 200, 0, 255) if z.get('status') == 'validated' else (255, 0, 0, 255)
+            cv2.drawContours(overlay, cnts, -1, col, th)
+            x = int(z.get('centroid_x_px', 0))
+            y = int(z.get('centroid_y_px', 0))
+            cv2.putText(overlay, f"D{z['id']}", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        max(0.5, th * 0.35), (255, 255, 255, 255), th + 2)
+            cv2.putText(overlay, f"D{z['id']}", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        max(0.5, th * 0.35), col, th)
+
+    def _refresh_change_table(self):
+        zones = getattr(self._result, 'change_zones', []) if self._result else []
+        has_classes = self._result is not None and 'point_class' in self._result.extra
+        self.change_table.setRowCount(len(zones))
+        for i, z in enumerate(zones):
+            area = (f"{z['area_m2']:.1f} m\u00b2" if z.get('area_m2') is not None
+                    else f"{z['area_points']} pt")
+            self.change_table.setItem(i, 0, QTableWidgetItem(f"D{z['id']}"))
+            self.change_table.setItem(i, 1, QTableWidgetItem(area))
+            self.change_table.setItem(i, 2, QTableWidgetItem(self._real_area_text(z)))
+            self.change_table.setItem(i, 3, QTableWidgetItem(f"{z.get('mean_quality', float('nan')):.2f}"))
+            st = QTableWidgetItem({'pending': '\u23f3', 'validated': 'distacco',
+                                   'rejected': 'falso'}.get(z.get('status', 'pending'), '?'))
+            st.setTextAlignment(Qt.AlignCenter)
+            self.change_table.setItem(i, 4, st)
+        self.btn_validate_changes.setEnabled(bool(zones))
+        if not has_classes:
+            self.change_info.setText(
+                "Disponibile con il metodo IC-GN: zone dove la roccia non e' piu' "
+                "riconoscibile (possibili distacchi).")
+        elif zones:
+            tot = sum(z['area_m2'] for z in zones if z.get('area_m2'))
+            self.change_info.setText(
+                f"{len(zones)} zone cambiate" + (f", {tot:.1f} m\u00b2 in totale" if tot else "")
+                + ". Validale con le immagini prima/dopo.")
+        else:
+            self.change_info.setText("Nessuna zona cambiata sopra l'area minima.")
+
+    def _open_change_validation(self, start=0):
+        zones = getattr(self._result, 'change_zones', []) if self._result else []
+        if not zones:
+            return
+        if self._ref_image is None or self._def_image is None:
+            QMessageBox.warning(self, "Errore",
+                                "Immagini riferimento/deformata non disponibili.")
+            return
+        dialog = ZoneValidationDialog(
+            zones=zones, result=self._result,
+            ref_image=self._ref_image, def_image=self._def_image,
+            ref_image_rgb=self._ref_image_rgb, def_image_rgb=self._def_image_rgb,
+            gsd=self._gsd, parent=self,
+            u=self._smoothed_u, v=self._smoothed_v)
+        dialog.setWindowTitle("Validazione distacchi")
+        if 0 < start < len(zones):
+            dialog._show_zone(start)
+        dialog.exec()
+        # statuses and perimeters are stored in the zone dicts (kept in the
+        # result and saved with the project); rejected zones stay 'falso'
+        self._refresh_change_table()
+        self._update_display()
+        self._update_statistics()
+
+    def get_change_zones(self):
+        if self._result is None:
+            return []
+        return list(getattr(self._result, 'change_zones', []))
 
     def _draw_vectors_on_overlay(self, overlay):
         """Draw displacement vectors on the overlay image."""
@@ -505,8 +766,13 @@ class ResultsViewerWidget(QWidget):
         mag = np.sqrt(u_val ** 2 + v_val ** 2) if not np.isnan(u_val) else float('nan')
         q_val = self._result.correlation_quality[iy, ix]
 
+        cls_txt = ""
+        if 'point_class' in self._result.extra:
+            from dic_app.core.change_detection import CLASS_NAMES
+            cls_txt = "Classe: " + CLASS_NAMES.get(
+                int(self._result.extra['point_class'][iy, ix]), "?") + "\n"
         text = (f"Posizione pixel: ({x}, {y})\n"
-                f"Punto griglia: [{iy}, {ix}]\n"
+                f"Punto griglia: [{iy}, {ix}]\n" + cls_txt +
                 f"U (px): {u_val:.3f}   V (px): {v_val:.3f}\n"
                 f"Magnitudine: {mag:.3f} px\n"
                 f"Qualita correlazione: {q_val:.4f}")
@@ -695,14 +961,42 @@ class ResultsViewerWidget(QWidget):
             self.zone_table.setItem(i, 1, QTableWidgetItem(str(zone['area_points'])))
             self.zone_table.setItem(i, 2, QTableWidgetItem(f"{zone['max_displacement']:.2f}"))
             self.zone_table.setItem(i, 3, QTableWidgetItem(f"{zone['mean_displacement']:.2f}"))
+            self.zone_table.setItem(i, 4, QTableWidgetItem(self._real_area_text(zone)))
             # Status column with colour
             status = zone.get('status', 'pending')
             status_item = QTableWidgetItem(
                 {'pending': '⏳', 'validated': '✅', 'rejected': '❌'}.get(status, '?'))
             status_item.setTextAlignment(Qt.AlignCenter)
-            self.zone_table.setItem(i, 4, status_item)
+            self.zone_table.setItem(i, 5, status_item)
 
         self.zones_detected.emit(self._active_zones)
+
+    def _real_area_text(self, zone):
+        dets = dt.zone_detachments(zone)
+        if not dets:
+            return "\u2014"
+        px, m2 = dt.zone_detachment_area(zone)
+        n = f" ({len(dets)})" if len(dets) > 1 else ""
+        return (f"{m2:.2f} m\u00b2" if m2 is not None else f"{px:.0f} px\u00b2") + n
+
+    def set_active_zones(self, zones):
+        """Restore saved active zones (with their perimeters)."""
+        self._active_zones = list(zones or [])
+        dt.apply_gsd(self._gsd, self._active_zones)
+        self._refresh_zone_table()
+        self.btn_validate_zones.setEnabled(bool(self._active_zones))
+        self._update_display()
+        self._update_statistics()
+
+    def get_detachment_summary(self):
+        shape = None
+        if self._ref_image is not None:
+            shape = self._ref_image.shape[:2]
+        elif (self._result is not None and self._result.ref_shape
+              and self._result.ref_shape[0]):
+            shape = tuple(self._result.ref_shape[:2])
+        return dt.summarize(self._active_zones, self.get_change_zones(),
+                            self._gsd, shape)
 
     def _zone_bbox_to_image_coords(self, zone):
         """Convert a zone's grid-index bbox to image pixel coordinates.
@@ -726,8 +1020,10 @@ class ResultsViewerWidget(QWidget):
         x1 = int(grid_x[r1, c1])
         y1 = int(grid_y[r1, c1])
 
-        # Add margin (half subset size) for context
+        # Margin for context (enough room to draw the whole scar)
+        x0, y0, x1, y1 = _include_perimeters(zone, x0, y0, x1, y1)
         margin = self._result.parameters.subset_size if self._result.parameters else 30
+        margin = max(margin, int(0.25 * max(x1 - x0, y1 - y0)))
         x0 = max(0, x0 - margin)
         y0 = max(0, y0 - margin)
         if self._ref_image is not None:
@@ -780,8 +1076,12 @@ class ResultsViewerWidget(QWidget):
             ref_crop, def_crop,
             (x0, y0, x1, y1),
             gsd=self._gsd,
-            parent=self)
+            parent=self, zone=zone, result=self._result,
+            u=self._smoothed_u, v=self._smoothed_v)
         dialog.exec()
+        self._refresh_zone_table()
+        self._update_display()
+        self._update_statistics()
 
     def _open_zone_validation(self):
         """Open the zone validation dialog to review all zones."""
@@ -805,7 +1105,7 @@ class ResultsViewerWidget(QWidget):
             ref_image_rgb=self._ref_image_rgb,
             def_image_rgb=self._def_image_rgb,
             gsd=self._gsd,
-            parent=self)
+            parent=self, u=self._smoothed_u, v=self._smoothed_v)
 
         if dialog.exec() == QDialog.Accepted:
             # Apply validated zones: remove rejected, keep validated + pending
@@ -873,6 +1173,23 @@ class ResultsViewerWidget(QWidget):
             text += f"---\n"
             text += f"Spostamento medio: {stats.get('mean_displacement_mm', 0):.1f} mm\n"
             text += f"Spostamento max:   {stats.get('max_displacement_mm', 0):.1f} mm\n"
+
+        sm = self.get_detachment_summary()
+        if sm['n_perimeters']:
+            text += "---\nDistacchi reali (perimetri disegnati):\n"
+            text += f"  Perimetri: {sm['n_perimeters']} in {sm['n_zones']} zone\n"
+            if sm['union_area_m2'] is not None:
+                text += f"  Area totale: {sm['union_area_m2']:.2f} m\u00b2\n"
+                text += f"  Distacco maggiore: {sm['largest_area_m2']:.2f} m\u00b2\n"
+            else:
+                text += f"  Area totale: {sm['union_area_px']:.0f} px\u00b2 (manca il GSD)\n"
+
+        if 'point_class' in self._result.extra:
+            from dic_app.core.change_detection import class_counts
+            text += "---\nClassi dei punti:\n"
+            for name, pct in class_counts(self._result.extra['point_class']).items():
+                if pct >= 0.05:
+                    text += f"  {name}: {pct:.1f}%\n"
 
         self.stats_text.setText(text)
 
@@ -1206,7 +1523,8 @@ class ResultsViewerWidget(QWidget):
             (x0c, y0c, x1c, y1c),
             gsd=self._gsd,
             allow_add_zone=has_result,
-            parent=self)
+            parent=self, result=self._result,
+            u=self._smoothed_u, v=self._smoothed_v)
         if has_result:
             dialog.zone_added.connect(self._add_manual_zone_from_bbox)
         dialog.exec()
@@ -1215,13 +1533,15 @@ class ResultsViewerWidget(QWidget):
     # Manual zone addition
     # ------------------------------------------------------------------
 
-    def _add_manual_zone_from_bbox(self, bbox):
+    def _add_manual_zone_from_bbox(self, bbox, detachments=None):
         """Create a manual active zone from an image-pixel bbox.
 
         Parameters
         ----------
         bbox : tuple (x0, y0, x1, y1) in image pixel coordinates
+        detachments : perimeters of the real detachment drawn in it
         """
+        detachments = list(detachments or [])
         if self._result is None or self._smoothed_u is None:
             return
 
@@ -1232,9 +1552,11 @@ class ResultsViewerWidget(QWidget):
 
         magnitude = compute_magnitude(self._smoothed_u, self._smoothed_v)
 
-        # Find grid points inside the bbox
-        inside = ((grid_x >= x0) & (grid_x <= x1) &
-                  (grid_y >= y0) & (grid_y <= y1))
+        # Find grid points inside the bbox (half-open, like the image
+        # slices [y0:y1, x0:x1]): a point on the border between two
+        # adjacent cells belongs to one cell only.
+        inside = ((grid_x >= x0) & (grid_x < x1) &
+                  (grid_y >= y0) & (grid_y < y1))
 
         # Get displacement values in the selected region
         region_mag = magnitude.copy()
@@ -1242,13 +1564,20 @@ class ResultsViewerWidget(QWidget):
         valid_mask = inside & ~np.isnan(magnitude)
 
         n_points = int(valid_mask.sum())
-        if n_points == 0:
+        if n_points == 0 and not detachments:
             return
 
-        valid_magnitudes = magnitude[valid_mask]
+        valid_magnitudes = (magnitude[valid_mask] if n_points
+                            else np.array([np.nan]))
 
         # Find bounding box in grid indices
-        rows, cols = np.where(valid_mask)
+        rows, cols = np.where(valid_mask if n_points else inside)
+        if rows.size == 0:          # perimeter smaller than a grid step
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            r = int(np.argmin(np.abs(grid_y[:, 0] - cy)))
+            c = int(np.argmin(np.abs(grid_x[0, :] - cx)))
+            rows, cols = np.array([r]), np.array([c])
         grid_row0 = int(rows.min())
         grid_row1 = int(rows.max()) + 1
         grid_col0 = int(cols.min())
@@ -1266,16 +1595,19 @@ class ResultsViewerWidget(QWidget):
             'centroid_row': centroid_row,
             'centroid_col': centroid_col,
             'area_points': n_points,
-            'max_displacement': float(np.nanmax(valid_magnitudes)),
-            'mean_displacement': float(np.nanmean(valid_magnitudes)),
+            'max_displacement': (float(np.nanmax(valid_magnitudes))
+                                 if n_points else float('nan')),
+            'mean_displacement': (float(np.nanmean(valid_magnitudes))
+                                  if n_points else float('nan')),
             'mean_quality': float('nan'),
             'bbox': (grid_row0, grid_col0, grid_row1, grid_col1),
             'status': 'validated',   # manual zones are pre-validated
             'manual': True,          # flag to distinguish from auto-detected
+            'detachments': detachments,
         }
 
         # Add quality if available
-        if self._result.correlation_quality is not None:
+        if n_points and self._result.correlation_quality is not None:
             q = self._result.correlation_quality[valid_mask]
             zone['mean_quality'] = float(np.nanmean(q))
 
@@ -1285,6 +1617,8 @@ class ResultsViewerWidget(QWidget):
         self._active_zones.append(zone)
         self._refresh_zone_table()
         self.btn_validate_zones.setEnabled(True)
+        self._update_display()
+        self._update_statistics()
 
     # ------------------------------------------------------------------
     # Grid inspection
@@ -1311,17 +1645,20 @@ class ResultsViewerWidget(QWidget):
             def_image_rgb=self._def_image_rgb,
             cell_size=self.grid_cell_size.value(),
             gsd=self._gsd,
-            parent=self)
+            parent=self, result=self._result,
+            u=self._smoothed_u, v=self._smoothed_v)
 
         if dialog.exec() == QDialog.Accepted:
-            marked_bboxes = dialog.get_marked_cells()
-            if marked_bboxes:
-                for bbox in marked_bboxes:
-                    self._add_manual_zone_from_bbox(bbox)
+            marked = dialog.get_marked_cells_with_detachments()
+            if marked:
+                for bbox, dets in marked:
+                    self._add_manual_zone_from_bbox(bbox, dets)
+                n_det = sum(len(d) for _, d in marked)
                 QMessageBox.information(
                     self, "Zone Aggiunte",
-                    f"{len(marked_bboxes)} celle marcate come deformate "
-                    f"aggiunte alle zone attive.")
+                    f"{len(marked)} celle marcate come deformate "
+                    f"aggiunte alle zone attive"
+                    + (f", con {n_det} perimetri di distacco." if n_det else "."))
 
     # ------------------------------------------------------------------
     # Getters
@@ -1340,6 +1677,15 @@ class ResultsViewerWidget(QWidget):
         return self._smoothed_u, self._smoothed_v
 
 
+def _include_perimeters(zone, x0, y0, x1, y1):
+    """Grow a crop box so it contains the zone's drawn perimeters."""
+    for d in dt.zone_detachments(zone or {}):
+        p = np.asarray(d['points'])
+        x0, y0 = min(x0, int(p[:, 0].min())), min(y0, int(p[:, 1].min()))
+        x1, y1 = max(x1, int(p[:, 0].max()) + 1), max(y1, int(p[:, 1].max()) + 1)
+    return x0, y0, x1, y1
+
+
 class AreaInspectionDialog(QDialog):
     """Compact dialog showing extracted ref/def image portions in tabs.
 
@@ -1352,18 +1698,23 @@ class AreaInspectionDialog(QDialog):
     """
 
     # Emitted when the user clicks "Aggiungi a Zone Attive".
-    # Carries the image-pixel bbox (x0, y0, x1, y1).
-    zone_added = pyqtSignal(tuple)
+    # Carries the image-pixel bbox (x0, y0, x1, y1) and the perimeters of
+    # the real detachment drawn in the area (list, may be empty).
+    zone_added = pyqtSignal(tuple, list)
 
     def __init__(self, ref_crop: np.ndarray, def_crop: np.ndarray,
                  bbox: tuple, gsd: float = None,
-                 allow_add_zone: bool = False, parent=None):
+                 allow_add_zone: bool = False, parent=None,
+                 zone=None, result=None, u=None, v=None):
         super().__init__(parent)
         self._ref_crop = ref_crop
         self._def_crop = def_crop
         self._bbox = bbox  # (x0, y0, x1, y1)
         self._gsd = gsd
         self._allow_add_zone = allow_add_zone
+        self._zone = zone            # existing zone: perimeters edited in place
+        self._result, self._u, self._v = result, u, v
+        self._added = False
         self.setWindowTitle("Ispezione Area Selezionata")
         self.setMinimumSize(400, 300)
         self.resize(700, 500)
@@ -1408,6 +1759,15 @@ class AreaInspectionDialog(QDialog):
         self._tab_widget.addTab(self.diff_viewer, "Differenza")
 
         layout.addWidget(self._tab_widget, stretch=1)
+
+        # Real detachment perimeter (existing zone, or area to add as zone)
+        self.drawer = None
+        if self._zone is not None or self._allow_add_zone:
+            self.drawer = DetachmentDrawer(
+                [self.ref_viewer, self.def_viewer, self.diff_viewer],
+                self._tab_widget, self)
+            self.drawer.changed.connect(self._on_detachments_changed)
+            layout.addWidget(self.drawer)
 
         # Buttons (compact row)
         btn_layout = QHBoxLayout()
@@ -1457,16 +1817,40 @@ class AreaInspectionDialog(QDialog):
         # Display images
         self._display_crops()
 
-    def _add_as_zone(self):
-        """Emit the bbox as a new manual active zone."""
-        self.zone_added.emit(self._bbox)
+    def _add_as_zone(self, quiet=False):
+        """Emit the bbox (+ drawn perimeters) as a new manual active zone."""
+        dets = self.drawer.detachments() if self.drawer is not None else []
+        self.zone_added.emit(tuple(self._bbox), dets)
+        self._added = True
         self.btn_add_zone.setEnabled(False)
         self.btn_add_zone.setText("✅ Aggiunta")
-        QMessageBox.information(
-            self, "Zona Aggiunta",
-            f"Area ({self._bbox[0]}, {self._bbox[1]})-"
-            f"({self._bbox[2]}, {self._bbox[3]}) aggiunta "
-            f"alle zone attive.")
+        if self.drawer is not None:
+            self.drawer.set_enabled_drawing(False)
+        if not quiet:
+            QMessageBox.information(
+                self, "Zona Aggiunta",
+                f"Area ({self._bbox[0]}, {self._bbox[1]})-"
+                f"({self._bbox[2]}, {self._bbox[3]}) aggiunta "
+                f"alle zone attive"
+                + (f" con {len(dets)} perimetri di distacco." if dets else "."))
+
+    def _on_detachments_changed(self, dets):
+        if self._zone is not None:
+            self._zone['detachments'] = dets
+            if dets and self._zone.get('status', 'pending') == 'pending':
+                self._zone['status'] = 'validated'     # a real detachment
+
+    def done(self, r):
+        if (self._allow_add_zone and not self._added and self.drawer is not None
+                and self.drawer.detachments()):
+            ans = QMessageBox.question(
+                self, "Perimetri non salvati",
+                "Hai disegnato il perimetro di un distacco ma non hai aggiunto "
+                "l'area alle zone attive.\nAggiungerla ora?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ans == QMessageBox.Yes:
+                self._add_as_zone(quiet=True)
+        super().done(r)
 
     def _display_crops(self):
         """Display the crops in the viewers."""
@@ -1478,6 +1862,12 @@ class AreaInspectionDialog(QDialog):
 
         # Compute and display difference image
         self._display_difference()
+
+        if self.drawer is not None:
+            self.drawer.set_context(
+                self._bbox[:2], self._ref_crop.shape,
+                (self._zone or {}).get('detachments'), self._gsd,
+                self._result, self._u, self._v)
 
     def _display_difference(self):
         """Compute and display absolute difference between ref and def."""
@@ -1609,9 +1999,13 @@ class ZoneValidationDialog(QDialog):
 
     def __init__(self, zones, result, ref_image, def_image,
                  ref_image_rgb=None, def_image_rgb=None,
-                 gsd=None, parent=None):
+                 gsd=None, parent=None, u=None, v=None):
         super().__init__(parent)
+        import copy as _copy
+        self._u, self._v = u, v
         self._zones = zones  # list of zone dicts (mutable — we modify status)
+        self._original_detachments = [_copy.deepcopy(z.get('detachments'))
+                                      for z in zones]
         self._result = result
         self._ref_image = ref_image
         self._def_image = def_image
@@ -1677,6 +2071,13 @@ class ZoneValidationDialog(QDialog):
         self.diff_viewer = ImageViewer()
         self._tab_widget.addTab(self.diff_viewer, "Differenza")
         layout.addWidget(self._tab_widget, stretch=1)
+
+        # --- Real detachment perimeter ---
+        self.drawer = DetachmentDrawer(
+            [self.ref_viewer, self.def_viewer, self.diff_viewer],
+            self._tab_widget, self)
+        self.drawer.changed.connect(self._on_detachments_changed)
+        layout.addWidget(self.drawer)
 
         # --- Action buttons ---
         action_row = QHBoxLayout()
@@ -1757,17 +2158,29 @@ class ZoneValidationDialog(QDialog):
 
         # Info
         bbox = zone['bbox']
-        info_parts = [
-            f"Area: {zone['area_points']} punti",
-            f"Max: {zone['max_displacement']:.2f} px",
-            f"Media: {zone['mean_displacement']:.2f} px",
-        ]
-        if self._gsd and self._gsd > 0:
+        if zone.get('kind') == 'change':
+            area = (f"{zone['area_m2']:.1f} m\u00b2" if zone.get('area_m2') is not None
+                    else f"{zone['area_points']} punti")
+            self.info_label.setText(
+                f"Possibile distacco D{zone['id']}  |  Area: {area}  |  "
+                f"Correlazione media: {zone.get('mean_quality', float('nan')):.2f}  |  "
+                f"Valida = distacco reale, Rifiuta = falso allarme")
+            info_parts = None
+        else:
+            info_parts = [
+                f"Area: {zone['area_points']} punti",
+                f"Max: {zone['max_displacement']:.2f} px",
+                f"Media: {zone['mean_displacement']:.2f} px",
+            ]
+        if info_parts is None:
+            pass
+        elif self._gsd and self._gsd > 0:
             max_mm = zone['max_displacement'] * self._gsd * 1000
             mean_mm = zone['mean_displacement'] * self._gsd * 1000
             info_parts.append(f"Max: {max_mm:.1f} mm  Media: {mean_mm:.1f} mm")
 
-        self.info_label.setText("  |  ".join(info_parts))
+        if info_parts is not None:
+            self.info_label.setText("  |  ".join(info_parts))
 
         # Enable/disable nav buttons
         self.btn_prev.setEnabled(self._current_idx > 0)
@@ -1819,6 +2232,24 @@ class ZoneValidationDialog(QDialog):
         # Difference
         self._display_diff(ref_crop, def_crop)
 
+        self.drawer.set_context((x0, y0), ref_crop.shape, zone.get('detachments'),
+                                self._gsd, self._result, self._u, self._v)
+
+    def _on_detachments_changed(self, dets):
+        zone = self._zones[self._current_idx]
+        zone['detachments'] = dets
+        if dets and zone.get('status', 'pending') == 'pending':
+            zone['status'] = 'validated'          # a real detachment
+        status = zone.get('status', 'pending')
+        self.btn_validate.setEnabled(status != 'validated')
+        self.btn_reject.setEnabled(status != 'rejected')
+        icon = {'pending': '[ ? ]', 'validated': '[ OK ]',
+                'rejected': '[ X ]'}.get(status, '?')
+        self.zone_label.setText(
+            f"Zona {self._current_idx + 1} / {len(self._zones)}  "
+            f"(ID {zone['id']})  {icon}")
+        self._update_summary()
+
     def _display_diff(self, ref_crop, def_crop):
         """Compute and show diff of two crops."""
         r, d = ref_crop, def_crop
@@ -1860,8 +2291,10 @@ class ZoneValidationDialog(QDialog):
         x1 = int(grid_x[r1, c1])
         y1 = int(grid_y[r1, c1])
 
+        x0, y0, x1, y1 = _include_perimeters(zone, x0, y0, x1, y1)
         margin = (self._result.parameters.subset_size
                   if self._result.parameters else 30)
+        margin = max(margin, int(0.25 * max(x1 - x0, y1 - y0)))
         x0 = max(0, x0 - margin)
         y0 = max(0, y0 - margin)
         if self._ref_image is not None:
@@ -1910,9 +2343,14 @@ class ZoneValidationDialog(QDialog):
         self._show_zone(self._current_idx + 1)
 
     def _cancel(self):
-        """Restore original statuses and close."""
-        for z, orig in zip(self._zones, self._original_statuses):
+        """Restore original statuses and perimeters, then close."""
+        for z, orig, dets in zip(self._zones, self._original_statuses,
+                                 self._original_detachments):
             z['status'] = orig
+            if dets is None:
+                z.pop('detachments', None)
+            else:
+                z['detachments'] = dets
         self.reject()
 
     def _update_summary(self):
@@ -1948,6 +2386,15 @@ class ZoneValidationDialog(QDialog):
 
     def keyPressEvent(self, event):
         key = event.key()
+        if self.drawer.is_drawing():
+            # while drawing, keys act on the perimeter, not on the zones
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                self.drawer.finish()
+            elif key == Qt.Key_Escape:
+                self.drawer.cancel()
+            elif key == Qt.Key_Backspace:
+                self.drawer.undo_point()
+            return
         if key == Qt.Key_Left:
             self._prev_zone()
         elif key == Qt.Key_Right:
@@ -1986,8 +2433,11 @@ class GridInspectionDialog(QDialog):
 
     def __init__(self, ref_image, def_image,
                  ref_image_rgb=None, def_image_rgb=None,
-                 cell_size=350, gsd=None, parent=None):
+                 cell_size=350, gsd=None, parent=None,
+                 result=None, u=None, v=None):
         super().__init__(parent)
+        self._result, self._u, self._v = result, u, v
+        self._cell_dets = {}          # cell index -> drawn perimeters
         self._ref_gray = ref_image
         self._def_gray = def_image
         self._ref_rgb = ref_image_rgb
@@ -1998,33 +2448,48 @@ class GridInspectionDialog(QDialog):
         # Build the grid of cell bounding boxes
         h, w = ref_image.shape[:2]
         self._img_h, self._img_w = h, w
-        self._cells = []          # list of (x0, y0, x1, y1)
-        self._cell_status = []    # 'normal' | 'deformed'
         cs = self._cell_size
-        for row_start in range(0, h, cs):
-            for col_start in range(0, w, cs):
-                x0 = col_start
-                y0 = row_start
-                x1 = min(col_start + cs, w)
-                y1 = min(row_start + cs, h)
-                # Skip very small edge cells (< 25% of full cell)
-                if (x1 - x0) * (y1 - y0) < cs * cs * 0.25:
-                    continue
-                self._cells.append((x0, y0, x1, y1))
-                self._cell_status.append('normal')
-
-        self._n_cols = max(1, (w + cs - 1) // cs)
+        self._cells, self._cell_rc, self._n_rows, self._n_cols = \
+            self.build_cells(h, w, cs)
+        self._cell_status = ['normal'] * len(self._cells)
         self._current_idx = 0
         self._n_cells = len(self._cells)
 
+        cw = round(w / self._n_cols)
+        ch = round(h / self._n_rows)
         self.setWindowTitle(
-            f"Ispezione Griglia ({cs}×{cs} px — "
-            f"{self._n_cells} celle)")
+            f"Ispezione Griglia ({self._n_rows}×{self._n_cols} celle "
+            f"di ~{cw}×{ch} px)")
         self.setMinimumSize(500, 400)
         self.resize(750, 550)
         self._setup_ui()
         if self._cells:
             self._show_cell(0)
+
+    @staticmethod
+    def build_cells(h, w, cell_size):
+        """Regular grid that tiles the whole image without gaps.
+
+        The number of cells per axis is the one closest to
+        ``dim / cell_size``; the image is then split into cells of equal
+        size (+-1 px), so no edge strip is left out and no edge cell is
+        much smaller than the others.
+
+        Returns (cells, cell_rc, n_rows, n_cols): ``cells`` is a list of
+        half-open boxes (x0, y0, x1, y1), ``cell_rc`` the (row, col) of
+        each cell, in row-major order.
+        """
+        n_cols = max(1, int(round(w / cell_size)))
+        n_rows = max(1, int(round(h / cell_size)))
+        xs = np.linspace(0, w, n_cols + 1).round().astype(int)
+        ys = np.linspace(0, h, n_rows + 1).round().astype(int)
+        cells, cell_rc = [], []
+        for r in range(n_rows):
+            for c in range(n_cols):
+                cells.append((int(xs[c]), int(ys[r]),
+                              int(xs[c + 1]), int(ys[r + 1])))
+                cell_rc.append((r, c))
+        return cells, cell_rc, n_rows, n_cols
 
     # ----------------------------------------------------------
     # UI
@@ -2078,6 +2543,13 @@ class GridInspectionDialog(QDialog):
         self._tab_widget.addTab(self.diff_viewer, "Differenza")
 
         layout.addWidget(self._tab_widget, stretch=1)
+
+        # --- Real detachment perimeter in this cell ---
+        self.drawer = DetachmentDrawer(
+            [self.ref_viewer, self.def_viewer, self.diff_viewer],
+            self._tab_widget, self)
+        self.drawer.changed.connect(self._on_detachments_changed)
+        layout.addWidget(self.drawer)
 
         # --- Action buttons ---
         action_row = QHBoxLayout()
@@ -2149,8 +2621,7 @@ class GridInspectionDialog(QDialog):
         x0, y0, x1, y1 = self._cells[self._current_idx]
         status = self._cell_status[self._current_idx]
 
-        grid_row = self._current_idx // self._n_cols
-        grid_col = self._current_idx % self._n_cols
+        grid_row, grid_col = self._cell_rc[self._current_idx]
 
         status_txt = "DEFORMATA" if status == 'deformed' else "Normale"
         self.cell_label.setText(
@@ -2228,6 +2699,28 @@ class GridInspectionDialog(QDialog):
         self.diff_viewer.set_image(diff_c)
         self.diff_viewer.fit_in_view()
 
+        self.drawer.set_context((x0, y0), ref_crop.shape,
+                                self._cell_dets.get(self._current_idx),
+                                self._gsd, self._result, self._u, self._v)
+
+    def _on_detachments_changed(self, dets):
+        """A perimeter drawn in a cell marks it as deformed."""
+        idx = self._current_idx
+        if dets:
+            self._cell_dets[idx] = dets
+            self._cell_status[idx] = 'deformed'
+        else:
+            self._cell_dets.pop(idx, None)
+        x0, y0, x1, y1 = self._cells[idx]
+        r, c = self._cell_rc[idx]
+        st = self._cell_status[idx]
+        self.cell_label.setText(
+            f"Cella {idx + 1} / {self._n_cells}  [riga {r + 1}, col {c + 1}]  "
+            f"{'🔴' if st == 'deformed' else '⚪'} "
+            f"{'DEFORMATA' if st == 'deformed' else 'Normale'}")
+        self.btn_mark_deformed.setEnabled(st != 'deformed')
+        self._update_summary()
+
     # ----------------------------------------------------------
     # Actions
     # ----------------------------------------------------------
@@ -2238,8 +2731,9 @@ class GridInspectionDialog(QDialog):
         self._advance()
 
     def _mark_normal(self):
-        """Mark current cell as normal and advance."""
+        """Mark current cell as normal and advance (drops its perimeters)."""
         self._cell_status[self._current_idx] = 'normal'
+        self._cell_dets.pop(self._current_idx, None)
         self._advance()
 
     def _advance(self):
@@ -2275,12 +2769,26 @@ class GridInspectionDialog(QDialog):
         return [self._cells[i] for i in range(self._n_cells)
                 if self._cell_status[i] == 'deformed']
 
+    def get_marked_cells_with_detachments(self):
+        """[(bbox, perimeters)] of the cells marked as deformed."""
+        return [(self._cells[i], list(self._cell_dets.get(i, [])))
+                for i in range(self._n_cells)
+                if self._cell_status[i] == 'deformed']
+
     # ----------------------------------------------------------
     # Keyboard
     # ----------------------------------------------------------
 
     def keyPressEvent(self, event):
         key = event.key()
+        if self.drawer.is_drawing():
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                self.drawer.finish()
+            elif key == Qt.Key_Escape:
+                self.drawer.cancel()
+            elif key == Qt.Key_Backspace:
+                self.drawer.undo_point()
+            return
         if key == Qt.Key_Left:
             self._prev_cell()
         elif key == Qt.Key_Right:

@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from datetime import datetime
 
+from dic_app.core import detachment as dt
 from dic_app.core.dic_engine import DICResult
 from dic_app.core.postprocessing import DisplacementStatistics
 from dic_app.utils.helpers import (
@@ -39,7 +40,16 @@ class ReportGenerator:
                  active_zones: list = None,
                  pipeline_info: str = "",
                  gsd: float = None,
-                 gps_info: dict = None):
+                 gps_info: dict = None,
+                 geo_frame: dict = None,
+                 change_zones: list = None):
+        # Zones where the surface changed (possible detachments); rejected
+        # ones (false alarms) are left out of the report.
+        self.change_zones = [z for z in (change_zones or [])
+                             if z.get('status') != 'rejected']
+        # geo_frame: {'original_shape': (h, w), 'pixel_offset': (x0, y0)}
+        # locating the analysed image inside the original GPS-tagged photo
+        self.geo_frame = geo_frame or {}
         self.result = result
         self.config = config
         self.base_image = base_image
@@ -54,6 +64,137 @@ class ReportGenerator:
 
     def set_progress_callback(self, callback):
         self._progress_callback = callback
+
+    # ------------------------------------------------------------------
+    # Real detachment perimeters (drawn by the operator)
+    # ------------------------------------------------------------------
+
+    def _image_shape(self):
+        if self.base_image is not None:
+            return self.base_image.shape[:2]
+        rs = getattr(self.result, 'ref_shape', None)
+        return tuple(rs[:2]) if rs is not None and len(rs) and rs[0] else None
+
+    def detachment_summary(self):
+        return dt.summarize(self.active_zones, self.change_zones, self.gsd,
+                            self._image_shape())
+
+    def _draw_perimeters(self, ax, zones, offset=(0, 0), labels=True, lw=1.8):
+        """Draw the perimeters of *zones* on a matplotlib axis (pixel
+        coordinates minus *offset*, for crops)."""
+        from matplotlib.patches import Polygon as MplPolygon
+        ox, oy = offset
+        n = 0
+        for z in zones:
+            for d in dt.zone_detachments(z):
+                pts = np.asarray(d['points'], float) - [ox, oy]
+                # outline only (dark halo + yellow): the inside stays visible
+                ax.add_patch(MplPolygon(pts, closed=True, facecolor='none',
+                                        edgecolor='black', linewidth=lw + 1.6))
+                ax.add_patch(MplPolygon(pts, closed=True, facecolor='none',
+                                        edgecolor=(1, 0.92, 0), linewidth=lw))
+                if labels:
+                    lab = f"{dt.zone_label(z)}-R{d['id']}"
+                    if d.get('area_m2') is not None:
+                        lab += f"\n{d['area_m2']:.1f} m\u00b2"
+                    ax.text(d['centroid'][0] - ox, d['centroid'][1] - oy, lab,
+                            color='black', fontsize=7, fontweight='bold',
+                            ha='center', va='center',
+                            bbox=dict(boxstyle='round,pad=0.15', fc=(1, 0.92, 0),
+                                      alpha=0.85, lw=0))
+                n += 1
+        return n
+
+    def _add_detachments_page(self, pdf):
+        """Map + table of the real detachment perimeters (cartography)."""
+        zones = dt.live_zones(self.active_zones, self.change_zones)
+        sm = self.detachment_summary()
+        fig = plt.figure(figsize=(11.69, 8.27))
+        ax = fig.add_axes([0.03, 0.33, 0.94, 0.58])
+        if self.base_image is not None:
+            ax.imshow(self.base_image, cmap='gray' if self.base_image.ndim == 2 else None)
+            h, w = self.base_image.shape[:2]
+            ax.set_xlim(0, w)
+            ax.set_ylim(h, 0)
+        self._draw_perimeters(ax, zones)
+        tot = (f"{sm['union_area_m2']:.2f} m\u00b2" if sm['union_area_m2'] is not None
+               else f"{sm['union_area_px']:.0f} px\u00b2")
+        ax.set_title(f"Carta dei distacchi reali: {sm['n_perimeters']} perimetri, "
+                     f"area totale {tot}", fontsize=13, fontweight='bold')
+        ax.axis('off')
+        if self.gsd:
+            # scale bar
+            h, w = self._image_shape() or (1, 1)
+            target = 0.15 * w * self.gsd
+            mag = 10 ** np.floor(np.log10(target))
+            L = max(v * mag for v in (1, 2, 5) if v * mag <= target)
+            Lpx = L / self.gsd
+            x0, y0 = 0.04 * w, 0.95 * h
+            ax.plot([x0, x0 + Lpx], [y0, y0], color='white', lw=5)
+            ax.plot([x0, x0 + Lpx], [y0, y0], color='black', lw=2)
+            ax.text(x0 + Lpx / 2, y0 - 0.02 * h, f"{L:g} m", ha='center',
+                    color='black', fontsize=8,
+                    bbox=dict(fc='white', alpha=0.7, lw=0, boxstyle='round,pad=0.1'))
+
+        tax = fig.add_axes([0.05, 0.02, 0.9, 0.27])
+        tax.axis('off')
+        rows = dt.rows(self.active_zones, self.change_zones, self.gsd)
+        stato = {'validated': 'validata', 'pending': 'da verificare'}
+        table_rows = []
+        for r in rows[:14]:
+            table_rows.append([
+                r['perimeter'],
+                f"{r['area_m2']:.2f}" if r['area_m2'] is not None else "-",
+                f"{r['area_px']:.0f}",
+                f"{r['perimeter_m']:.1f}" if r['perimeter_m'] is not None else "-",
+                f"{r['max_disp_mm']:.1f}" if r['max_disp_mm'] is not None else (
+                    f"{r['max_disp_px']:.2f} px" if r['max_disp_px'] == r['max_disp_px']
+                    and r['max_disp_px'] is not None else "-"),
+                f"{r['centroid_x']:.0f}, {r['centroid_y']:.0f}",
+                stato.get(r['status'], r['status'])])
+        if table_rows:
+            t = tax.table(cellText=table_rows,
+                          colLabels=["Perimetro", "Area (m\u00b2)", "Area (px\u00b2)",
+                                     "Perimetro (m)", "Spost. max (mm)",
+                                     "Centro (px)", "Zona"],
+                          loc='upper center', cellLoc='center')
+            t.auto_set_font_size(False)
+            t.set_fontsize(8)
+            for j in range(7):
+                t[0, j].set_facecolor('#8e24aa')
+                t[0, j].set_text_props(color='white', fontweight='bold')
+            if len(rows) > 14:
+                tax.text(0.5, -0.04, f"... altri {len(rows) - 14} perimetri "
+                         f"(elenco completo in distacchi_reali.csv)",
+                         ha='center', fontsize=8, transform=tax.transAxes)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def export_detachments(self, output_dir: str):
+        """distacchi_reali.csv + distacchi_reali.geojson (if any perimeter)."""
+        rows = dt.rows(self.active_zones, self.change_zones, self.gsd)
+        if not rows:
+            return []
+        out = []
+        path = os.path.join(output_dir, "distacchi_reali.csv")
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            wr = csv.writer(f, delimiter=';')
+            wr.writerow(["perimetro", "zona", "stato", "area_m2", "area_px2",
+                         "perimetro_m", "centro_x_px", "centro_y_px",
+                         "spost_medio_mm", "spost_max_mm"])
+            for r in rows:
+                fmt = (lambda v: "" if v is None or v != v else f"{v:.4f}")
+                wr.writerow([r['perimeter'], r['zone'], r['status'], fmt(r['area_m2']),
+                             fmt(r['area_px']), fmt(r['perimeter_m']),
+                             fmt(r['centroid_x']), fmt(r['centroid_y']),
+                             fmt(r['mean_disp_mm']), fmt(r['max_disp_mm'])])
+        out.append(path)
+        gj = os.path.join(output_dir, "distacchi_reali.geojson")
+        if dt.export_geojson(gj, self.active_zones, self.change_zones, self.gsd,
+                             self.gps_info, self.geo_frame, self._image_shape()):
+            out.append(gj)
+        logger.info(f"Detachment perimeters exported: {out}")
+        return out
 
     def _report_progress(self, percent, msg=""):
         if self._progress_callback:
@@ -87,6 +228,10 @@ class ReportGenerator:
             self._report_progress(80, "Esportazione GeoTIFF...")
             self.export_geotiff(output_dir)
             step += 1
+
+        if self.detachment_summary()['n_perimeters']:
+            self._report_progress(95, "Esportazione perimetri dei distacchi...")
+            self.export_detachments(output_dir)
 
         self._report_progress(100, "Report completato!")
 
@@ -122,6 +267,12 @@ class ReportGenerator:
             page_generators.append(('zones', self._add_zones_page))
         if sections.get('zone_details', True) and self.active_zones:
             page_generators.append(('zone_details', self._add_zone_detail_pages))
+        if 'point_class' in getattr(self.result, 'extra', {}):
+            page_generators.append(('changes', self._add_change_map_page))
+            if self.change_zones:
+                page_generators.append(('change_details', self._add_change_detail_pages))
+        if self.detachment_summary()['n_perimeters']:
+            page_generators.append(('detachments', self._add_detachments_page))
         if sections.get('statistics', True):
             page_generators.append(('statistics', self._add_statistics_page))
 
@@ -292,7 +443,8 @@ class ReportGenerator:
             ax.set_title(f"{title} ({unit_label})", fontsize=14, fontweight='bold')
             ax.set_xlabel("X (pixel)")
             ax.set_ylabel("Y (pixel)")
-            ax.invert_yaxis()
+            if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+                ax.invert_yaxis()
 
             plt.tight_layout()
             pdf.savefig(fig)
@@ -312,7 +464,8 @@ class ReportGenerator:
                           step=3, scale=3.0, color='red', width=0.003)
 
         ax.set_title("Campo Vettoriale Spostamenti", fontsize=14, fontweight='bold')
-        ax.invert_yaxis()
+        if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+            ax.invert_yaxis()
         plt.tight_layout()
         pdf.savefig(fig)
         plt.close(fig)
@@ -329,7 +482,8 @@ class ReportGenerator:
             plt.colorbar(sc, ax=ax, label='NCC', shrink=0.6)
 
         ax.set_title("Mappa Qualita Correlazione", fontsize=14, fontweight='bold')
-        ax.invert_yaxis()
+        if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+            ax.invert_yaxis()
         plt.tight_layout()
         pdf.savefig(fig)
         plt.close(fig)
@@ -357,7 +511,8 @@ class ReportGenerator:
                 plt.colorbar(sc, ax=ax, label='strain', shrink=0.6)
 
             ax.set_title(title, fontsize=14, fontweight='bold')
-            ax.invert_yaxis()
+            if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+                ax.invert_yaxis()
             plt.tight_layout()
             pdf.savefig(fig)
             plt.close(fig)
@@ -502,13 +657,16 @@ class ReportGenerator:
                     bbox=dict(boxstyle='round,pad=0.2',
                               facecolor=color, alpha=0.85, edgecolor='none'))
 
+        self._draw_perimeters(ax, display_zones)
+
         n_val = sum(1 for z in display_zones
                     if z.get('status') == 'validated')
         ax.set_title(
             f"Tavola Sinottica Zone Attive ({n_val} validate su "
             f"{len(self.active_zones)} totali)",
             fontsize=14, fontweight='bold')
-        ax.invert_yaxis()
+        if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+            ax.invert_yaxis()
         plt.tight_layout()
         pdf.savefig(fig)
         plt.close(fig)
@@ -611,6 +769,10 @@ class ReportGenerator:
                 max_mm = zone['max_displacement'] * self.gsd * 1000
                 mean_mm = zone['mean_displacement'] * self.gsd * 1000
                 info_parts.append(f"({max_mm:.1f} / {mean_mm:.1f} mm)")
+            px, m2 = dt.zone_detachment_area(zone)
+            if dt.zone_detachments(zone):
+                info_parts.append("distacco reale " + (f"{m2:.2f} m\u00b2" if m2 is not None
+                                                       else f"{px:.0f} px\u00b2"))
             fig.text(0.5, 0.93, "  |  ".join(info_parts),
                      ha='center', fontsize=10, color='gray')
 
@@ -623,9 +785,134 @@ class ReportGenerator:
                     ax.imshow(img, cmap='gray')
                 else:
                     ax.imshow(img)
+                self._draw_perimeters(ax, [zone], offset=(max(0, x0), max(0, y0)),
+                                      labels=(title == titles[1]))
+                ax.set_xlim(0, img.shape[1])
+                ax.set_ylim(img.shape[0], 0)
                 ax.set_title(title, fontsize=11)
                 ax.axis('off')
 
+            plt.tight_layout(rect=[0, 0, 1, 0.91])
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    def _crop_pair(self, zone):
+        x0, y0, x1, y1 = self._zone_to_pixel_bbox(zone)
+        if self.base_image is None or x1 <= x0 or y1 <= y0:
+            return None
+        h_img, w_img = self.base_image.shape[:2]
+        ref_crop = self.base_image[max(0, y0):min(h_img, y1),
+                                   max(0, x0):min(w_img, x1)].copy()
+        def_src = (self.deformed_image_rgb if self.deformed_image_rgb is not None
+                   else self.deformed_image)
+        if def_src is None:
+            return None
+        dh, dw = def_src.shape[:2]
+        def_crop = def_src[max(0, y0):min(dh, y1), max(0, x0):min(dw, x1)].copy()
+        return ref_crop, def_crop, (x0, y0, x1, y1)
+
+    def _add_change_map_page(self, pdf):
+        """Map of point classes with change zones and a summary table."""
+        from dic_app.core.change_detection import (
+            CLASS_COLORS, CLASS_NAMES, NODATA, class_counts)
+        cls = self.result.extra['point_class']
+        fig = plt.figure(figsize=(11.69, 8.27))
+        ax = fig.add_axes([0.04, 0.30, 0.92, 0.62])
+        if self.base_image is not None:
+            ax.imshow(self.base_image if self.base_image.ndim == 3 else self.base_image,
+                      cmap=None if self.base_image.ndim == 3 else 'gray', alpha=0.55)
+        rgba = np.zeros(cls.shape + (4,), np.float32)
+        for k, c in CLASS_COLORS.items():
+            m = cls == k
+            rgba[m, :3] = np.array(c) / 255.0
+            rgba[m, 3] = 0.0 if k == NODATA else 0.55
+        gx, gy = self.result.grid_x, self.result.grid_y
+        sx = (gx[0, 1] - gx[0, 0]) if gx.shape[1] > 1 else 1
+        sy = (gy[1, 0] - gy[0, 0]) if gy.shape[0] > 1 else 1
+        ax.imshow(rgba, extent=(gx[0, 0] - sx / 2, gx[0, -1] + sx / 2,
+                                gy[-1, 0] + sy / 2, gy[0, 0] - sy / 2),
+                  interpolation='nearest')
+        zid = self.result.extra.get('change_zone_id')
+        for z in self.change_zones:
+            col = 'lime' if z.get('status') == 'validated' else 'red'
+            if zid is not None and np.any(zid == z['id']):
+                ax.contour(gx, gy, (zid == z['id']).astype(float), levels=[0.5],
+                           colors=[col], linewidths=1.2)
+            ax.text(z.get('centroid_x_px', 0), z.get('centroid_y_px', 0),
+                    f"D{z['id']}", color=col, fontsize=7, fontweight='bold',
+                    ha='center', va='center',
+                    bbox=dict(boxstyle='round,pad=0.1', fc='black', alpha=0.4, lw=0))
+        self._draw_perimeters(ax, self.change_zones, labels=False)
+        if self.base_image is not None:
+            h, w = self.base_image.shape[:2]
+            ax.set_xlim(0, w)
+            ax.set_ylim(h, 0)
+        ax.set_title("Classi dei punti e zone cambiate (possibili distacchi)",
+                     fontsize=13, fontweight='bold')
+        ax.axis('off')
+        # legend
+        counts = class_counts(cls)
+        handles = [plt.Rectangle((0, 0), 1, 1, color=np.array(CLASS_COLORS[k]) / 255.0)
+                   for k in CLASS_NAMES if k != NODATA]
+        labels = [f"{CLASS_NAMES[k]} ({counts[CLASS_NAMES[k]]:.1f}%)"
+                  for k in CLASS_NAMES if k != NODATA]
+        ax.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.01),
+                  ncol=4, fontsize=7, frameon=False)
+        # table
+        tax = fig.add_axes([0.1, 0.03, 0.8, 0.19])
+        tax.axis('off')
+        if self.change_zones:
+            rows = []
+            for z in self.change_zones[:12]:
+                area = f"{z['area_m2']:.1f}" if z.get('area_m2') is not None else "-"
+                stato = {'validated': 'distacco confermato',
+                         'pending': 'da verificare'}.get(z.get('status'), '')
+                rows.append([f"D{z['id']}", area, f"{z['area_points']}",
+                             f"{z.get('mean_quality', float('nan')):.2f}",
+                             f"{z.get('centroid_x_px', 0):.0f}, {z.get('centroid_y_px', 0):.0f}",
+                             stato])
+            t = tax.table(cellText=rows, colLabels=["Zona", "Area (m\u00b2)", "Punti",
+                                                     "Correlazione", "Centro (px)", "Stato"],
+                          loc='upper center', cellLoc='center')
+            t.auto_set_font_size(False)
+            t.set_fontsize(8)
+            if len(self.change_zones) > 12:
+                tax.text(0.5, -0.05, f"... altre {len(self.change_zones) - 12} zone",
+                         ha='center', fontsize=8, transform=tax.transAxes)
+        else:
+            tax.text(0.5, 0.5, "Nessuna zona cambiata sopra l'area minima.",
+                     ha='center', fontsize=11, transform=tax.transAxes)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _add_change_detail_pages(self, pdf):
+        """Before / after / difference for each change zone (max 20)."""
+        for z in self.change_zones[:20]:
+            pair = self._crop_pair(z)
+            if pair is None:
+                continue
+            ref_crop, def_crop, (cx0, cy0, _, _) = pair
+            diff = self._compute_diff_image(ref_crop, def_crop)
+            fig, axes = plt.subplots(1, 3, figsize=(11.69, 8.27))
+            stato = {'validated': 'distacco confermato',
+                     'pending': 'da verificare'}.get(z.get('status'), '')
+            fig.suptitle(f"Zona cambiata D{z['id']} - {stato}", fontsize=14,
+                         fontweight='bold', y=0.98)
+            area = (f"{z['area_m2']:.1f} m\u00b2" if z.get('area_m2') is not None
+                    else f"{z['area_points']} punti")
+            fig.text(0.5, 0.93, f"Area: {area}  |  correlazione media "
+                     f"{z.get('mean_quality', float('nan')):.2f}  |  "
+                     f"la roccia non e' piu' riconoscibile tra i due rilievi",
+                     ha='center', fontsize=10, color='gray')
+            for ax, img, title in zip(axes, [ref_crop, def_crop, diff],
+                                      ["Prima (riferimento)", "Dopo", "Differenza"]):
+                ax.imshow(img, cmap='gray' if img.ndim == 2 else None)
+                self._draw_perimeters(ax, [z], offset=(max(0, cx0), max(0, cy0)),
+                                      labels=(title == "Dopo"))
+                ax.set_xlim(0, img.shape[1])
+                ax.set_ylim(img.shape[0], 0)
+                ax.set_title(title, fontsize=11)
+                ax.axis('off')
             plt.tight_layout(rect=[0, 0, 1, 0.91])
             pdf.savefig(fig)
             plt.close(fig)
@@ -696,6 +983,12 @@ class ReportGenerator:
         if self.gsd:
             table_data.append(["Spost. medio", f"{stats.get('mean_displacement_mm', 0):.1f} mm"])
             table_data.append(["Spost. max", f"{stats.get('max_displacement_mm', 0):.1f} mm"])
+        sm = self.detachment_summary()
+        if sm['n_perimeters']:
+            table_data.append(["Distacchi reali", f"{sm['n_perimeters']} perimetri"])
+            table_data.append(["Area distacchi", (
+                f"{sm['union_area_m2']:.2f} m\u00b2" if sm['union_area_m2'] is not None
+                else f"{sm['union_area_px']:.0f} px\u00b2")])
 
         table = ax.table(cellText=table_data, loc='center', cellLoc='left',
                          colWidths=[0.5, 0.5])
@@ -786,7 +1079,8 @@ class ReportGenerator:
                     plt.colorbar(sc, ax=ax, shrink=0.6)
 
                 ax.set_title(name.replace('_', ' ').title())
-                ax.invert_yaxis()
+                if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+                    ax.invert_yaxis()
                 plt.tight_layout()
                 fig.savefig(os.path.join(output_dir, f"{name}.png"), dpi=150)
             except Exception as e:
@@ -806,7 +1100,8 @@ class ReportGenerator:
                           self.result.grid_x, self.result.grid_y,
                           step=3, scale=3.0, color='red')
         ax.set_title("Vector Field")
-        ax.invert_yaxis()
+        if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+            ax.invert_yaxis()
         plt.tight_layout()
         fig.savefig(os.path.join(output_dir, "vector_field.png"), dpi=150)
         plt.close(fig)
@@ -825,7 +1120,8 @@ class ReportGenerator:
                         c=field[valid], cmap='coolwarm', s=2)
                     plt.colorbar(sc, ax=ax, shrink=0.6)
                 ax.set_title(f"Strain {key}")
-                ax.invert_yaxis()
+                if not ax.yaxis_inverted():  # imshow already puts row 0 on top
+                    ax.invert_yaxis()
                 plt.tight_layout()
                 fig.savefig(os.path.join(output_dir, f"strain_{key}.png"), dpi=150)
                 plt.close(fig)
@@ -867,7 +1163,14 @@ class ReportGenerator:
                 f"lon={gps.longitude}. Skipping GeoTIFF export.")
             return
 
-        image_shape = self.result.ref_shape
+        # The GPS position refers to the centre of the ORIGINAL photo, while
+        # the DIC grid lives in the analysed (possibly alignment-cropped)
+        # image: pass both the original shape and the crop offset.
+        frame = self.geo_frame or {}
+        image_shape = tuple(frame.get('original_shape') or self.result.ref_shape)
+        pixel_offset = tuple(frame.get('pixel_offset') or (0, 0))
+        geo_kwargs = dict(grid_x=self.result.grid_x, grid_y=self.result.grid_y,
+                          pixel_offset=pixel_offset)
         mag = compute_magnitude(self.result.u, self.result.v)
 
         for field, name in [
@@ -876,13 +1179,15 @@ class ReportGenerator:
             (self.result.v, "displacement_v"),
         ]:
             filepath = os.path.join(output_dir, f"{name}.tif")
-            georef.create_geotiff(field, filepath, gps, self.gsd, image_shape)
+            georef.create_geotiff(field, filepath, gps, self.gsd, image_shape,
+                                  **geo_kwargs)
 
         if self.strain_data:
             for key in ['E_xx', 'E_yy', 'E_xy', 'principal_1', 'max_shear']:
                 if key in self.strain_data:
                     filepath = os.path.join(output_dir, f"strain_{key}.tif")
                     georef.create_geotiff(
-                        self.strain_data[key], filepath, gps, self.gsd, image_shape)
+                        self.strain_data[key], filepath, gps, self.gsd,
+                        image_shape, **geo_kwargs)
 
         logger.info(f"GeoTIFF files exported to: {output_dir}")
